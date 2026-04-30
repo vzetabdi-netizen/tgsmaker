@@ -3,14 +3,17 @@ services:
     name: svg-tgs-bot
     env: python
     plan: starter
-    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    pythonVersion: "3.11.10"
+    buildCommand: >
+      pip install --upgrade pip &&
+      pip install -r requirements.txt
     startCommand: python enhanced_bot.py
     envVars:
       - key: BOT_TOKEN
-        sync: false        # Render dashboard → Environment
+        sync: false
       - key: DATABASE_URL
-        sync: false        # Your MongoDB Atlas connection string
+        sync: false
       - key: OWNER_ID
-        sync: false        # Your Telegram user ID
+        sync: false
       - key: MONGO_DB_NAME
-        value: svg_tgs_bot # MongoDB database name (can leave as-is)
+        value: svg_tgs_bot
