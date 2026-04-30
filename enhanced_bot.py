@@ -1,14 +1,11 @@
 #!/usr/bin/env python3
 """
-Enhanced Telegram Bot — SVG to TGS Conversion
-Features:
-  - SVG (512×512) → TGS conversion
-  - Batch processing up to 15 files
-  - Free plan  : 5 conversions/day
-  - Pro plan   : unlimited, paid via Telegram Stars
-  - /upgrade, /myplan, /myhistory, /mystats  (user commands)
-  - /giveplan, /removeplan, /ban, /unban, /broadcast, /stats  (admin)
-  - /makeadmin, /removeadmin  (owner only)
+Enhanced Telegram Bot — SVG/PNG to TGS Conversion
+Commands:
+  User   : /start /help /upgrade /myplan /myhistory /mystats
+  Admin  : /giveplan /giveplanall /removeplan /removeplanall /setprice
+           /ban /unban /broadcast /stats /adminhelp
+  Owner  : /makeadmin /removeadmin
 """
 
 import os
@@ -18,12 +15,10 @@ import tempfile
 import asyncio
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
-from http.server import BaseHTTPRequestHandler, HTTPServer
-import threading
 
 from database import Database
 from batch_converter import BatchConverter
-from svg_validator import SVGValidator
+from svg_validator import SVGValidator, PNGValidator
 from converter import SVGToTGSConverter
 from config import Config
 from plans import FREE_PLAN, PRO_PLAN, get_plan, format_plan_card, format_upgrade_message
@@ -34,8 +29,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Instant processing — effectively no delay
-BATCH_DELAY = 0.01
+BATCH_DELAY = 3.0
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _parse_days(raw: str) -> int | None:
+    """Extract integer days from strings like '30', '30days', '30d'. Returns None if invalid."""
+    digits = ''.join(filter(str.isdigit, raw))
+    if not digits:
+        return None
+    val = int(digits)
+    return val if 1 <= val <= 3650 else None
 
 
 class EnhancedSVGToTGSBot:
@@ -43,12 +50,12 @@ class EnhancedSVGToTGSBot:
         self.config = Config()
         self.db = Database()
         self.svg_validator = SVGValidator()
+        self.png_validator = PNGValidator()
         self.converter = SVGToTGSConverter()
         self.batch_converter = BatchConverter()
         self.base_url = f"https://api.telegram.org/bot{self.config.bot_token}"
         self.offset = 0
 
-        # Batch state per user
         self.user_files: dict[int, list]           = {}
         self.user_timers: dict[int, asyncio.Task]  = {}
         self.user_waiting_message: dict[int, dict] = {}
@@ -60,15 +67,16 @@ class EnhancedSVGToTGSBot:
         if oid:
             self.db.add_user(oid, "Bot Owner", "Bot", "Owner")
             self.db.set_admin(oid, True)
-            self.db.set_user_plan(oid, 'pro', expires_at=None, granted_by=oid)
+            self.db.set_user_plan(oid, 'pro', expires_at=None,
+                                  granted_by=oid, granted_via='giveplan')
             logger.info(f"Owner {oid} initialised as admin with Pro plan")
 
     # ================================================================== #
-    # Polling loop
+    # Polling
     # ================================================================== #
 
     async def start(self):
-        logger.info("Starting SVG → TGS bot…")
+        logger.info("Starting SVG/PNG → TGS bot…")
         try:
             me = await self._api_get("getMe")
             logger.info(f"Bot online: @{me.get('username', '?')}")
@@ -82,7 +90,6 @@ class EnhancedSVGToTGSBot:
                 for upd in updates:
                     asyncio.create_task(self._handle_update(upd))
             except KeyboardInterrupt:
-                logger.info("Bot stopped.")
                 break
             except Exception as e:
                 logger.error(f"Polling error: {e}")
@@ -91,8 +98,7 @@ class EnhancedSVGToTGSBot:
     async def _get_updates(self) -> list:
         params = {'offset': self.offset, 'limit': 100, 'timeout': 10}
         resp = await asyncio.to_thread(
-            requests.get, f"{self.base_url}/getUpdates",
-            params=params, timeout=15
+            requests.get, f"{self.base_url}/getUpdates", params=params, timeout=15
         )
         if resp.status_code != 200:
             return []
@@ -150,7 +156,7 @@ class EnhancedSVGToTGSBot:
         parts   = text.split()
         cmd     = parts[0].lower().split('@')[0]
 
-        # ── Public commands ─────────────────────────────────────────
+        # ── Public ──────────────────────────────────────────────────
         if cmd == '/start':
             await self._send_welcome_message(chat_id, user_id)
         elif cmd == '/help':
@@ -161,18 +167,16 @@ class EnhancedSVGToTGSBot:
             await self._handle_myplan(chat_id, user_id)
         elif cmd == '/myhistory':
             await self._handle_myhistory(chat_id, user_id)
-        elif cmd == '/redeem':
-            await self._handle_redeem(chat_id, user_id, parts)
         elif cmd == '/mystats':
             await self._handle_mystats(chat_id, user_id)
 
-        # ── Owner-only commands ─────────────────────────────────────
+        # ── Owner only ───────────────────────────────────────────────
         elif cmd == '/makeadmin' and user_id == self.config.owner_id:
             await self._handle_makeadmin(chat_id, parts)
         elif cmd == '/removeadmin' and user_id == self.config.owner_id:
             await self._handle_removeadmin(chat_id, parts)
 
-        # ── Admin commands ──────────────────────────────────────────
+        # ── Admin ────────────────────────────────────────────────────
         elif self.db.is_admin(user_id):
             if cmd == '/stats':
                 await self._send_admin_stats(chat_id)
@@ -182,16 +186,14 @@ class EnhancedSVGToTGSBot:
                 await self._handle_ban(chat_id, parts[1])
             elif cmd == '/unban' and len(parts) > 1:
                 await self._handle_unban(chat_id, parts[1])
-            elif cmd == '/giveplan' and len(parts) > 1:
+            elif cmd == '/giveplan':
                 await self._handle_giveplan(chat_id, user_id, parts)
-            elif cmd == '/removeplan' and len(parts) > 1:
-                await self._handle_removeplan(chat_id, user_id, parts)
-            elif cmd == '/topusers':
-                await self._handle_topusers(chat_id)
             elif cmd == '/giveplanall':
                 await self._handle_giveplanall(chat_id, user_id, parts)
+            elif cmd == '/removeplan' and len(parts) > 1:
+                await self._handle_removeplan(chat_id, user_id, parts)
             elif cmd == '/removeplanall':
-                await self._handle_removeplanall(chat_id, user_id, parts)
+                await self._handle_removeplanall(chat_id, user_id)
             elif cmd == '/setprice':
                 await self._handle_setprice(chat_id, user_id, parts)
             elif cmd == '/adminhelp':
@@ -202,7 +204,7 @@ class EnhancedSVGToTGSBot:
             await self.send_message(chat_id, "❌ Unknown command. Use /help.")
 
     # ================================================================== #
-    # User plan commands
+    # User commands
     # ================================================================== #
 
     async def _handle_myplan(self, chat_id: int, user_id: int):
@@ -211,10 +213,10 @@ class EnhancedSVGToTGSBot:
         info    = self.db.get_subscription_info(user_id)
         used, _, remaining = self._usage_status(user_id, plan)
 
-        exp_str       = "Never" if info.get('expires_at') is None else \
-                        info['expires_at'].strftime('%Y-%m-%d')
-        remaining_str = "Unlimited" if remaining == -1 else str(remaining)
+        expires_at    = info.get('expires_at')
+        exp_str       = "Never" if expires_at is None else expires_at.strftime('%Y-%m-%d')
         limit_str     = "Unlimited" if plan.daily_limit == -1 else str(plan.daily_limit)
+        remaining_str = "Unlimited" if remaining == -1 else str(remaining)
 
         text = (
             f"{plan.emoji} <b>Your Plan: {plan.name}</b>\n\n"
@@ -232,7 +234,6 @@ class EnhancedSVGToTGSBot:
         history = self.db.get_user_conversion_history(user_id, limit=100)
         total   = len(history)
         success = sum(1 for h in history if h['success'])
-        failed  = total - success
         plan_id = self.db.get_user_plan(user_id)
         plan    = get_plan(plan_id)
         used, _, remaining = self._usage_status(user_id, plan)
@@ -243,7 +244,7 @@ class EnhancedSVGToTGSBot:
             f"{plan.emoji} Plan          : {plan.name}\n"
             f"🔄 Total converted : {total}\n"
             f"✅ Successful      : {success}\n"
-            f"❌ Failed          : {failed}\n"
+            f"❌ Failed          : {total - success}\n"
             f"📅 Used today      : {used}\n"
             f"⏳ Remaining today : {remaining_str}\n"
         )
@@ -260,24 +261,23 @@ class EnhancedSVGToTGSBot:
             status  = "✅" if h['success'] else "❌"
             name    = h.get('file_name') or 'unknown'
             ftype   = (h.get('file_type') or 'svg').upper()
-            size    = h.get('file_size') or 0
-            date    = h['conversion_date'].strftime('%m-%d %H:%M') \
-                      if h.get('conversion_date') else '?'
-            size_kb = round(size / 1024, 1)
+            size_kb = round((h.get('file_size') or 0) / 1024, 1)
+            dt      = h.get('conversion_date')
+            date    = dt.strftime('%m-%d %H:%M') if dt else '?'
             lines.append(f"{i}. {status} <code>{name}</code> [{ftype}] {size_kb}KB — {date}")
 
         await self.send_message(chat_id, "\n".join(lines))
 
     # ================================================================== #
-    # Upgrade / Telegram Stars payment
+    # Upgrade / Telegram Stars
     # ================================================================== #
 
     async def _handle_upgrade(self, chat_id: int, user_id: int):
         plan_id = self.db.get_user_plan(user_id)
         if plan_id == 'pro':
             info    = self.db.get_subscription_info(user_id)
-            exp_str = "Never" if info.get('expires_at') is None else \
-                      info['expires_at'].strftime('%Y-%m-%d')
+            expires = info.get('expires_at')
+            exp_str = "Never" if expires is None else expires.strftime('%Y-%m-%d')
             await self.send_message(
                 chat_id,
                 f"⭐ You are already on the <b>Pro</b> plan!\nExpires: {exp_str}"
@@ -286,15 +286,13 @@ class EnhancedSVGToTGSBot:
         await self._send_stars_invoice(chat_id, user_id)
 
     async def _send_stars_invoice(self, chat_id: int, user_id: int):
-        price = self.db.get_effective_price('pro', PRO_PLAN.price_stars)
+        # Always read current price from DB
+        price = self.db.get_pro_price(default=PRO_PLAN.price_stars)
         url   = f"{self.base_url}/sendInvoice"
         data  = {
             'chat_id':        chat_id,
             'title':          '⭐ Pro Plan — 1 Month',
-            'description':    (
-                'Unlimited SVG to TGS conversions for 30 days. '
-                'Batch up to 50 files at once.'
-            ),
+            'description':    'Unlimited SVG & PNG → TGS conversions for 30 days. Batch up to 15 files.',
             'payload':        f'pro_1month_{user_id}',
             'currency':       'XTR',
             'prices':         f'[{{"label":"Pro Plan 1 Month","amount":{price}}}]',
@@ -303,8 +301,7 @@ class EnhancedSVGToTGSBot:
         resp = await asyncio.to_thread(requests.post, url, data=data)
         if resp.status_code != 200:
             logger.error(f"sendInvoice failed: {resp.text}")
-            pro_price = self.db.get_effective_price('pro', PRO_PLAN.price_stars)
-            await self.send_message(chat_id, format_upgrade_message(FREE_PLAN, pro_price=pro_price))
+            await self.send_message(chat_id, format_upgrade_message(FREE_PLAN))
 
     async def _answer_pre_checkout(self, pcq: dict):
         url  = f"{self.base_url}/answerPreCheckoutQuery"
@@ -318,136 +315,301 @@ class EnhancedSVGToTGSBot:
         charge_id = payment['telegram_payment_charge_id']
         stars     = payment['total_amount']
 
-        expires = datetime.now(timezone.utc) + timedelta(days=30)
-        self.db.set_user_plan(user_id, 'pro', expires_at=expires)
+        expires = _now() + timedelta(days=30)
+        self.db.set_user_plan(user_id, 'pro', expires_at=expires,
+                              granted_via='payment')
         self.db.log_payment(user_id, charge_id, stars, 'pro', status='completed')
 
-        exp_str = expires.strftime('%Y-%m-%d')
         await self.send_message(
             chat_id,
             f"🎉 <b>Pro Plan Activated!</b>\n\n"
-            f"Thank you for your payment of <b>{stars} ⭐ Stars</b>.\n"
-            f"Your Pro plan is active until <b>{exp_str}</b>.\n\n"
+            f"Thank you for <b>{stars} ⭐ Stars</b>.\n"
+            f"Pro plan active until <b>{expires.strftime('%Y-%m-%d')}</b>.\n\n"
             f"Enjoy unlimited conversions! 🚀"
         )
-        logger.info(f"User {user_id} upgraded to Pro (charge {charge_id}, {stars} Stars)")
+        logger.info(f"User {user_id} upgraded to Pro via payment ({stars} Stars)")
 
     # ================================================================== #
-    # Admin plan management
+    # Admin — plan management
     # ================================================================== #
 
     async def _handle_giveplan(self, chat_id: int, admin_id: int, parts: list):
         """
-        /giveplan [user_id] [plan_id] [days]
-        days is optional; if omitted the plan never expires.
+        /giveplan [user_id] [plan] [days]
+        days optional — omit for permanent.
+        Example: /giveplan 123456789 pro 30
         """
         if len(parts) < 3:
             await self.send_message(
                 chat_id,
-                "❌ Usage: /giveplan [user_id] [plan_id] [days]\n"
+                "❌ Usage: /giveplan [user_id] [plan] [days]\n"
                 "Example: /giveplan 123456789 pro 30\n"
-                "Omit [days] for a permanent grant."
+                "Omit [days] for permanent grant."
             )
             return
+
         try:
             uid     = int(parts[1])
             plan_id = parts[2].lower()
+
             if plan_id not in ('free', 'pro'):
-                await self.send_message(chat_id, "❌ plan_id must be 'free' or 'pro'.")
+                await self.send_message(chat_id, "❌ Plan must be 'free' or 'pro'.")
                 return
 
             expires_at = None
             days_given = None
             if len(parts) >= 4:
-                days_given = int(parts[3])
-                expires_at = datetime.now(timezone.utc) + timedelta(days=days_given)
+                days_given = _parse_days(parts[3])
+                if days_given is None:
+                    await self.send_message(chat_id, "❌ Invalid days (1–3650).")
+                    return
+                expires_at = _now() + timedelta(days=days_given)
 
-            self.db.set_user_plan(uid, plan_id, expires_at=expires_at, granted_by=admin_id)
+            self.db.add_user(uid)
+            ok = self.db.set_user_plan(uid, plan_id, expires_at=expires_at,
+                                       granted_by=admin_id, granted_via='giveplan')
+            if not ok:
+                await self.send_message(chat_id, f"❌ Failed to set plan for user {uid}.")
+                return
 
             plan    = get_plan(plan_id)
-            exp_str = "Never (permanent)" if expires_at is None \
-                      else expires_at.strftime('%Y-%m-%d')
+            exp_str = "Never (permanent)" if expires_at is None else expires_at.strftime('%Y-%m-%d')
 
-            # Notify admin
             await self.send_message(
                 chat_id,
-                f"✅ {plan.emoji} <b>{plan.name}</b> plan granted to user <code>{uid}</code>\n"
+                f"✅ {plan.emoji} <b>{plan.name}</b> granted to <code>{uid}</code>\n"
                 f"Expires: {exp_str}"
             )
 
             # Notify the user
-            if days_given is not None:
-                user_notif = (
-                    f"🎁 <b>Plan Update!</b>\n\n"
-                    f"An admin has given you the {plan.emoji} <b>{plan.name}</b> plan "
-                    f"for <b>{days_given} days</b>.\n"
-                    f"📅 Expires: <b>{expires_at.strftime('%Y-%m-%d')}</b>\n\n"
+            if days_given:
+                user_msg = (
+                    f"🎁 <b>Plan Updated!</b>\n\n"
+                    f"An admin gave you {plan.emoji} <b>{plan.name}</b> for <b>{days_given} days</b>.\n"
+                    f"Expires: <b>{expires_at.strftime('%Y-%m-%d')}</b>\n\n"
+                    f"Enjoy your conversions! 🚀"
                 )
             else:
-                user_notif = (
-                    f"🎁 <b>Plan Update!</b>\n\n"
-                    f"An admin has given you the {plan.emoji} <b>{plan.name}</b> plan "
-                    f"<b>permanently</b>.\n\n"
-                )
-
-            # Add plan details to notification
-            if plan_id == 'pro':
-                user_notif += (
-                    f"✅ Unlimited conversions\n"
-                    f"📦 Batch up to {plan.batch_limit} files\n\n"
-                    f"Use /myplan to see your quota. Enjoy! 🚀"
-                )
-            else:
-                user_notif += (
-                    f"📊 Daily limit: {plan.daily_limit} conversions\n"
-                    f"📦 Batch up to {plan.batch_limit} files\n\n"
-                    f"Use /upgrade to get Pro."
+                user_msg = (
+                    f"🎁 <b>Plan Updated!</b>\n\n"
+                    f"An admin gave you {plan.emoji} <b>{plan.name}</b> <b>permanently</b>.\n\n"
+                    f"Enjoy unlimited conversions! 🚀"
                 )
             try:
-                await self.send_message(uid, user_notif)
-            except Exception as e:
-                logger.warning(f"Could not notify user {uid} about plan grant: {e}")
+                await self.send_message(uid, user_msg)
+            except Exception:
+                pass
 
-            logger.info(f"Admin {admin_id} gave {plan_id} plan to user {uid} (expires {expires_at})")
+            logger.info(f"Admin {admin_id} gave {plan_id} to user {uid} (expires {expires_at})")
 
         except ValueError:
-            await self.send_message(chat_id, "❌ Invalid user_id or days value.")
+            await self.send_message(chat_id, "❌ Invalid user_id.")
+
+    async def _handle_giveplanall(self, chat_id: int, admin_id: int, parts: list):
+        """
+        /giveplanall [plan] [days]
+        Tags every row with granted_via='giveplanall' so /removeplanall only targets them.
+        Example: /giveplanall pro 7
+        """
+        if len(parts) < 3:
+            await self.send_message(
+                chat_id,
+                "❌ Usage: /giveplanall [plan] [days]\n"
+                "Example: /giveplanall pro 7"
+            )
+            return
+
+        try:
+            plan_id = parts[1].lower()
+            if plan_id not in ('free', 'pro'):
+                await self.send_message(chat_id, "❌ Plan must be 'free' or 'pro'.")
+                return
+
+            days = _parse_days(parts[2])
+            if days is None:
+                await self.send_message(chat_id, "❌ Invalid days (1–3650).")
+                return
+
+            expires_at = _now() + timedelta(days=days)
+            plan       = get_plan(plan_id)
+            exp_str    = expires_at.strftime('%Y-%m-%d')
+
+            pm    = await self.send_message(chat_id, "⏳ Applying plan to all users…")
+            count = self.db.set_plan_all_users(plan_id, expires_at, granted_by=admin_id)
+
+            # Notify all users
+            all_uids = self.db.get_all_users()
+            if plan_id == 'pro':
+                user_msg = (
+                    f"🎉 <b>Plan Updated!</b>\n\n"
+                    f"⭐ An admin activated <b>Pro</b> for you!\n"
+                    f"📅 Expires: <b>{exp_str}</b>\n\n"
+                    f"✅ Unlimited conversions, batch up to {plan.batch_limit} files.\n"
+                    f"Enjoy! 🚀"
+                )
+            else:
+                user_msg = (
+                    f"ℹ️ <b>Plan Updated!</b>\n\n"
+                    f"🆓 Your plan was set to <b>Free</b> by an admin.\n"
+                    f"📅 Valid until: <b>{exp_str}</b>\n"
+                    f"Use /upgrade to get Pro."
+                )
+
+            notified = 0
+            for uid in all_uids:
+                if uid == admin_id:
+                    continue
+                try:
+                    await self.send_message(uid, user_msg)
+                    notified += 1
+                    await asyncio.sleep(0.05)
+                except Exception:
+                    pass
+
+            summary = (
+                f"✅ {plan.emoji} <b>{plan.name}</b> applied to <b>{count}</b> users!\n"
+                f"📅 Expires: <b>{exp_str}</b>\n"
+                f"📨 Notified: <b>{notified}</b> users\n\n"
+                f"ℹ️ Use /removeplanall to revert only these users."
+            )
+            if pm:
+                await self.edit_message(chat_id, pm['message_id'], summary)
+            else:
+                await self.send_message(chat_id, summary)
+
+        except Exception as e:
+            logger.error(f"giveplanall error: {e}")
+            await self.send_message(chat_id, f"❌ Error: {e}")
 
     async def _handle_removeplan(self, chat_id: int, admin_id: int, parts: list):
         """
-        /removeplan [user_id]  — Downgrade user to Free immediately.
+        /removeplan [user_id] — Downgrade one user to Free.
         """
         if len(parts) < 2:
             await self.send_message(chat_id, "❌ Usage: /removeplan [user_id]")
             return
         try:
             uid = int(parts[1])
-            self.db.set_user_plan(uid, 'free', expires_at=None, granted_by=admin_id)
+            self.db.add_user(uid)
+            self.db.set_user_plan(uid, 'free', expires_at=None,
+                                  granted_by=admin_id, granted_via=None)
 
-            # Notify admin
             await self.send_message(
                 chat_id,
-                f"✅ User <code>{uid}</code> has been downgraded to the Free plan."
+                f"✅ User <code>{uid}</code> downgraded to 🆓 Free."
             )
-
-            # Notify the user
             try:
                 await self.send_message(
                     uid,
-                    "⚠️ <b>Plan Update!</b>\n\n"
-                    "Your plan has been changed to 🆓 <b>Free</b> by an admin.\n\n"
+                    "⚠️ <b>Plan Updated!</b>\n\n"
+                    "Your plan was changed to 🆓 <b>Free</b> by an admin.\n"
                     "Daily limit: 5 conversions/day.\n"
-                    "Use /upgrade to get Pro again."
+                    "Use /upgrade to get Pro."
                 )
-            except Exception as e:
-                logger.warning(f"Could not notify user {uid} about plan removal: {e}")
+            except Exception:
+                pass
 
             logger.info(f"Admin {admin_id} removed plan from user {uid}")
         except ValueError:
             await self.send_message(chat_id, "❌ Invalid user ID.")
 
+    async def _handle_removeplanall(self, chat_id: int, admin_id: int):
+        """
+        /removeplanall
+        Reverts ONLY users who got Pro via /giveplanall.
+        Users who PAID or got individual /giveplan are NOT affected.
+        """
+        pm = await self.send_message(
+            chat_id,
+            "⏳ Reverting users who received Pro via /giveplanall…"
+        )
+
+        # Get list before downgrading (for notifications)
+        affected_uids = self.db.get_users_by_granted_via('giveplanall')
+        count         = self.db.remove_plan_all_users(granted_by=admin_id)
+
+        # Notify affected users
+        notified = 0
+        for uid in affected_uids:
+            try:
+                await self.send_message(
+                    uid,
+                    "ℹ️ <b>Plan Updated!</b>\n\n"
+                    "Your temporary Pro plan (from admin gift) has ended.\n"
+                    "You are now on the 🆓 <b>Free</b> plan.\n\n"
+                    "Use /upgrade to get Pro anytime. ⭐"
+                )
+                notified += 1
+                await asyncio.sleep(0.05)
+            except Exception:
+                pass
+
+        summary = (
+            f"✅ <b>Done!</b>\n\n"
+            f"👥 Reverted: <b>{count}</b> users → 🆓 Free\n"
+            f"📨 Notified: <b>{notified}</b> users\n\n"
+            f"ℹ️ Users who <b>paid</b> or got individual <b>/giveplan</b> were <b>not affected</b>."
+        )
+        if pm:
+            await self.edit_message(chat_id, pm['message_id'], summary)
+        else:
+            await self.send_message(chat_id, summary)
+
+        logger.info(f"Admin {admin_id} ran removeplanall — reverted {count} users")
+
     # ================================================================== #
-    # Admin user commands
+    # Admin — setprice
+    # ================================================================== #
+
+    async def _handle_setprice(self, chat_id: int, admin_id: int, parts: list):
+        """
+        /setprice [stars]
+        Example: /setprice 50
+        Shows current price if no amount given.
+        """
+        current_price = self.db.get_pro_price(default=PRO_PLAN.price_stars)
+
+        if len(parts) < 2:
+            await self.send_message(
+                chat_id,
+                f"⭐ <b>Current Pro price: {current_price} Stars/month</b>\n\n"
+                f"To change it:\n"
+                f"<code>/setprice 50</code>"
+            )
+            return
+
+        try:
+            new_price = int(parts[1])
+            if new_price < 1:
+                await self.send_message(chat_id, "❌ Price must be at least 1 Star.")
+                return
+            if new_price > 10000:
+                await self.send_message(chat_id, "❌ Price cannot exceed 10,000 Stars.")
+                return
+
+            ok = self.db.set_pro_price(new_price, set_by=admin_id)
+            if ok:
+                await self.send_message(
+                    chat_id,
+                    f"✅ <b>Pro price updated!</b>\n\n"
+                    f"Old price : <b>{current_price} ⭐ Stars/month</b>\n"
+                    f"New price : <b>{new_price} ⭐ Stars/month</b>\n\n"
+                    f"Next /upgrade will charge {new_price} ⭐."
+                )
+                logger.info(f"Admin {admin_id} set pro price {current_price}→{new_price} Stars")
+            else:
+                await self.send_message(chat_id, "❌ Failed to update price.")
+
+        except ValueError:
+            await self.send_message(
+                chat_id,
+                f"❌ Invalid amount.\n"
+                f"Example: <code>/setprice 50</code>\n"
+                f"Current price: {current_price} ⭐"
+            )
+
+    # ================================================================== #
+    # Admin — user management
     # ================================================================== #
 
     async def _handle_makeadmin(self, chat_id: int, parts: list):
@@ -473,7 +635,7 @@ class EnhancedSVGToTGSBot:
                 await self.send_message(chat_id, "❌ Cannot remove owner admin privileges.")
                 return
             if self.db.set_admin(uid, False):
-                await self.send_message(chat_id, f"✅ User <code>{uid}</code> is no longer an admin.")
+                await self.send_message(chat_id, f"✅ User <code>{uid}</code> is no longer admin.")
             else:
                 await self.send_message(chat_id, f"❌ User <code>{uid}</code> not found.")
         except ValueError:
@@ -486,7 +648,7 @@ class EnhancedSVGToTGSBot:
                 await self.send_message(chat_id, "❌ Cannot ban the bot owner.")
                 return
             if self.db.ban_user(uid):
-                await self.send_message(chat_id, f"✅ User <code>{uid}</code> has been banned.")
+                await self.send_message(chat_id, f"✅ User <code>{uid}</code> banned.")
             else:
                 await self.send_message(chat_id, f"❌ User <code>{uid}</code> not found.")
         except ValueError:
@@ -496,29 +658,30 @@ class EnhancedSVGToTGSBot:
         try:
             uid = int(uid_str)
             if self.db.unban_user(uid):
-                await self.send_message(chat_id, f"✅ User <code>{uid}</code> has been unbanned.")
+                await self.send_message(chat_id, f"✅ User <code>{uid}</code> unbanned.")
             else:
-                await self.send_message(chat_id, f"❌ User <code>{uid}</code> not found or not banned.")
+                await self.send_message(chat_id, f"❌ User <code>{uid}</code> not found.")
         except ValueError:
             await self.send_message(chat_id, "❌ Invalid user ID.")
 
     async def _send_admin_stats(self, chat_id: int):
         try:
-            s = self.db.get_stats()
-            pro_price = s.get('pro_price', PRO_PLAN.price_stars)
-            text = (
+            s     = self.db.get_stats()
+            price = self.db.get_pro_price(default=PRO_PLAN.price_stars)
+            text  = (
                 "<b>📊 Bot Statistics</b>\n\n"
                 f"👥 Total Users        : {s.get('total_users', 0)}\n"
                 f"🟢 Active (7 days)    : {s.get('active_users', 0)}\n"
-                f"🚫 Banned             : {s.get('banned_users', 0)}\n"
-                f"🔑 Admins             : {s.get('admin_users', 0)}\n"
-                f"⭐ Pro Users          : {s.get('pro_users', 0)}\n\n"
+                f"🚫 Banned             : {s.get('banned_users', 0)}\n\n"
+                f"⭐ Pro Users (total)  : {s.get('pro_users', 0)}\n"
+                f"   💳 Paid            : {s.get('pro_paid', 0)}\n"
+                f"   🎁 Gifted          : {s.get('pro_gifted', 0)}\n\n"
                 f"🔄 Total Conversions  : {s.get('total_conversions', 0)}\n"
                 f"✅ Successful         : {s.get('success_conversions', 0)}\n"
                 f"📊 Success Rate       : {s.get('success_rate', 0)}%\n\n"
                 f"💰 Stars Earned       : {s.get('total_stars_earned', 0)} ⭐\n"
-                f"💎 Pro Price          : {pro_price} ⭐/month\n\n"
-                f"🕐 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC"
+                f"💲 Pro Price          : {price} ⭐/month\n\n"
+                f"🕐 {_now().strftime('%Y-%m-%d %H:%M:%S')} UTC"
             )
             await self.send_message(chat_id, text)
         except Exception as e:
@@ -528,7 +691,6 @@ class EnhancedSVGToTGSBot:
     async def _handle_broadcast_command(self, msg: dict):
         chat_id  = msg['chat']['id']
         admin_id = msg['from']['id']
-
         if 'reply_to_message' in msg:
             await self._do_broadcast(chat_id, msg['reply_to_message'], admin_id)
         else:
@@ -537,7 +699,7 @@ class EnhancedSVGToTGSBot:
             if len(parts) < 2:
                 await self.send_message(
                     chat_id,
-                    "❌ Usage: /broadcast [message]  or reply to a message with /broadcast"
+                    "❌ Usage: /broadcast [message]  or reply with /broadcast"
                 )
                 return
             await self._do_broadcast(chat_id, {'text': parts[1]}, admin_id)
@@ -562,7 +724,6 @@ class EnhancedSVGToTGSBot:
         progress = await self.send_message(admin_chat_id,
                                            f"📡 Broadcasting to {len(users)} users…")
         sent = failed = 0
-
         for i, uid in enumerate(users):
             if uid == admin_id:
                 continue
@@ -594,7 +755,7 @@ class EnhancedSVGToTGSBot:
             await self.edit_message(admin_chat_id, progress['message_id'], final)
 
     # ================================================================== #
-    # Document handling — SVG and ZIP only
+    # Document handling
     # ================================================================== #
 
     async def _handle_document(self, msg: dict):
@@ -608,20 +769,28 @@ class EnhancedSVGToTGSBot:
 
         if self._is_svg_file(doc):
             await self._queue_file(msg, 'svg')
+        elif self._is_png_file(doc):
+            await self._queue_file(msg, 'png')
         elif (doc.get('mime_type') == 'application/zip' or
               doc.get('file_name', '').lower().endswith('.zip')):
             await self._handle_batch_zip(msg)
         else:
             await self.send_message(
                 chat_id,
-                "❌ Please send SVG files only.\n"
-                "SVG must be exactly 512×512 px."
+                "❌ Please send SVG or PNG files.\n"
+                "SVG: must be 512×512 px\n"
+                "PNG: must be at least 100×100 px"
             )
 
     @staticmethod
     def _is_svg_file(doc: dict) -> bool:
         return (doc.get('mime_type') == 'image/svg+xml' or
                 doc.get('file_name', '').lower().endswith('.svg'))
+
+    @staticmethod
+    def _is_png_file(doc: dict) -> bool:
+        return (doc.get('mime_type') == 'image/png' or
+                doc.get('file_name', '').lower().endswith('.png'))
 
     # ================================================================== #
     # Batch queue
@@ -641,11 +810,10 @@ class EnhancedSVGToTGSBot:
 
         allowed, used, remaining = self.db.check_daily_limit(user_id, plan.daily_limit)
         if not allowed:
-            upgrade_hint = "\n\n💎 Upgrade to Pro for unlimited conversions — /upgrade" \
-                           if plan_id == 'free' else ""
+            upgrade_hint = "\n\n💎 Upgrade to Pro — /upgrade" if plan_id == 'free' else ""
             await self.send_message(
                 chat_id,
-                f"⛔ You've reached your daily limit of <b>{plan.daily_limit}</b> conversions.\n"
+                f"⛔ Daily limit reached: <b>{plan.daily_limit}</b> conversions.\n"
                 f"Used today: {used}{upgrade_hint}"
             )
             return
@@ -657,8 +825,8 @@ class EnhancedSVGToTGSBot:
         if pending >= plan.batch_limit:
             await self.send_message(
                 chat_id,
-                f"❌ Your plan allows max <b>{plan.batch_limit}</b> files per batch.\n"
-                f"Please wait for the current batch to finish."
+                f"❌ Max <b>{plan.batch_limit}</b> files per batch.\n"
+                f"Wait for current batch to finish."
             )
             return
 
@@ -670,18 +838,13 @@ class EnhancedSVGToTGSBot:
             )
             return
 
-        self.user_files[user_id].append({
-            'document':  doc,
-            'file_type': file_type,
-        })
+        self.user_files[user_id].append({'document': doc, 'file_type': file_type})
 
-        # Show spinner only on the first file
         if len(self.user_files[user_id]) == 1:
             self.user_waiting_message[user_id] = await self.send_message(
-                chat_id, "⏳ Converting…"
+                chat_id, f"⏳ Please wait {int(BATCH_DELAY)} seconds…"
             )
 
-        # Reset timer on every new file
         if user_id in self.user_timers:
             self.user_timers[user_id].cancel()
 
@@ -715,35 +878,35 @@ class EnhancedSVGToTGSBot:
         plan    = get_plan(plan_id)
 
         successful: list[dict] = []
-        failed_count            = 0
+        failed_count = 0
 
         for i, fi in enumerate(files):
             doc   = fi['document']
-            fname = doc.get('file_name', f'file_{i+1}.svg')
+            ftype = fi['file_type']
+            fname = doc.get('file_name', f'file_{i+1}.{ftype}')
 
             try:
-                fpath = await self._download_file(doc['file_id'], suffix='.svg')
+                fpath = await self._download_file(doc['file_id'], suffix=f'.{ftype}')
                 try:
-                    ok, err = self.svg_validator.validate_svg_file(fpath)
+                    ok, err = (self.svg_validator.validate_svg_file(fpath)
+                               if ftype == 'svg' else
+                               self.png_validator.validate_png_file(fpath))
                     if not ok:
                         failed_count += 1
-                        await self.send_message(chat_id, f"❌ <code>{fname}</code>: {err}")
                         self.db.add_conversion(user_id, fname, doc['file_size'],
-                                               success=False, file_type='svg')
+                                               success=False, file_type=ftype)
                         continue
 
                     tgs_path = await self.converter.convert(fpath)
-                    tgs_name = Path(fname).stem + '.tgs'
-                    successful.append({'tgs_path': tgs_path, 'filename': tgs_name})
+                    successful.append({'tgs_path': tgs_path, 'filename': Path(fname).stem + '.tgs'})
                     self.db.add_conversion(user_id, fname, doc['file_size'],
-                                           success=True, file_type='svg')
+                                           success=True, file_type=ftype)
 
                 except Exception as e:
                     logger.error(f"Conversion error [{fname}]: {e}")
                     failed_count += 1
-                    await self.send_message(chat_id, f"❌ <code>{fname}</code>: Conversion failed.")
                     self.db.add_conversion(user_id, fname, doc['file_size'],
-                                           success=False, file_type='svg')
+                                           success=False, file_type=ftype)
                 finally:
                     if os.path.exists(fpath):
                         os.unlink(fpath)
@@ -766,25 +929,24 @@ class EnhancedSVGToTGSBot:
 
         if waiting_msg:
             try:
-                await self.edit_message(chat_id, waiting_msg['message_id'], "✅ Done!")
-            except Exception as e:
-                logger.error(f"edit_message error: {e}")
+                await self.edit_message(chat_id, waiting_msg['message_id'], "✅ Done — 100%")
+            except Exception:
+                pass
 
-        # Quota reminder for Free users
         if plan_id == 'free' and successful:
             used_now = self.db.get_today_usage(user_id)
             left     = max(0, plan.daily_limit - used_now)
             if left == 0:
                 await self.send_message(
                     chat_id,
-                    f"⚠️ You've used all {plan.daily_limit} free conversions for today.\n"
-                    f"Upgrade to Pro for unlimited access — /upgrade"
+                    f"⚠️ All {plan.daily_limit} free conversions used today.\n"
+                    f"Upgrade to Pro — /upgrade"
                 )
             else:
                 await self.send_message(
                     chat_id,
-                    f"💡 {left} free conversion{'s' if left != 1 else ''} remaining today. "
-                    f"Use /upgrade for unlimited."
+                    f"💡 {left} free conversion{'s' if left != 1 else ''} left today. "
+                    f"/upgrade for unlimited."
                 )
 
     # ================================================================== #
@@ -798,19 +960,17 @@ class EnhancedSVGToTGSBot:
 
         plan_id = self.db.get_user_plan(user_id)
         plan    = get_plan(plan_id)
-        allowed, used, remaining = self.db.check_daily_limit(user_id, plan.daily_limit)
+        allowed, used, _ = self.db.check_daily_limit(user_id, plan.daily_limit)
         if not allowed:
             upgrade = "\n\nUpgrade with /upgrade" if plan_id == 'free' else ""
             await self.send_message(
-                chat_id,
-                f"⛔ Daily limit reached ({plan.daily_limit} conversions).{upgrade}"
+                chat_id, f"⛔ Daily limit reached.{upgrade}"
             )
             return
 
         try:
             pm    = await self.send_message(chat_id, "🔄 Processing ZIP archive…")
             zpath = await self._download_file(doc['file_id'], suffix='.zip')
-
             try:
                 fpaths, names, errors = self.batch_converter.extract_files_from_zip(
                     zpath, max_files=plan.batch_limit
@@ -819,21 +979,22 @@ class EnhancedSVGToTGSBot:
                     await self.send_message(chat_id, f"❌ ZIP errors: {'; '.join(errors)}")
                     return
                 if not fpaths:
-                    await self.send_message(chat_id, "❌ No SVG files found in ZIP.")
+                    await self.send_message(chat_id, "❌ No SVG files in ZIP.")
                     return
 
                 results = await self.batch_converter.convert_batch(fpaths, names)
                 self.batch_converter.cleanup_temp_files(fpaths)
 
-                if results['successful']:
-                    for cr in results['successful']:
-                        try:
-                            await self._send_document(chat_id, cr['tgs_path'], cr['output_name'])
-                        except Exception as e:
-                            logger.error(f"ZIP send error: {e}")
-                        finally:
-                            if os.path.exists(cr['tgs_path']):
-                                os.unlink(cr['tgs_path'])
+                for cr in results['successful']:
+                    try:
+                        await self._send_document(chat_id, cr['tgs_path'], cr['output_name'])
+                    except Exception as e:
+                        logger.error(f"ZIP send error: {e}")
+                    finally:
+                        if os.path.exists(cr['tgs_path']):
+                            os.unlink(cr['tgs_path'])
+
+                if results['success_count']:
                     self.db.increment_today_usage(user_id, results['success_count'])
 
                 summary = (
@@ -843,16 +1004,12 @@ class EnhancedSVGToTGSBot:
                 )
                 if pm:
                     await self.edit_message(chat_id, pm['message_id'], summary)
-                else:
-                    await self.send_message(chat_id, summary)
-
             finally:
                 if os.path.exists(zpath):
                     os.unlink(zpath)
-
         except Exception as e:
             logger.error(f"ZIP error: {e}")
-            await self.send_message(chat_id, f"❌ ZIP processing failed: {e}")
+            await self.send_message(chat_id, f"❌ ZIP failed: {e}")
 
     # ================================================================== #
     # Telegram API helpers
@@ -886,7 +1043,7 @@ class EnhancedSVGToTGSBot:
         )
         if resp.status_code == 200:
             return resp.json()['result']
-        logger.error(f"sendMessage failed ({resp.status_code}): {resp.text[:200]}")
+        logger.error(f"sendMessage failed: {resp.text[:200]}")
         return None
 
     async def edit_message(self, chat_id, message_id, text: str) -> dict | None:
@@ -897,7 +1054,6 @@ class EnhancedSVGToTGSBot:
         )
         if resp.status_code == 200:
             return resp.json()['result']
-        logger.error(f"editMessageText failed: {resp.text[:200]}")
         return None
 
     async def _send_document(self, chat_id, fpath: str, fname: str, caption: str = '') -> dict | None:
@@ -919,7 +1075,6 @@ class EnhancedSVGToTGSBot:
         )
         if resp.status_code == 200:
             return resp.json()['result']
-        logger.error(f"sendDocument(id) failed: {resp.text[:200]}")
         return None
 
     async def _send_photo(self, chat_id, photo_id: str, caption: str = '') -> dict | None:
@@ -929,7 +1084,6 @@ class EnhancedSVGToTGSBot:
         )
         if resp.status_code == 200:
             return resp.json()['result']
-        logger.error(f"sendPhoto failed: {resp.text[:200]}")
         return None
 
     async def _send_video(self, chat_id, video_id: str, caption: str = '') -> dict | None:
@@ -939,11 +1093,10 @@ class EnhancedSVGToTGSBot:
         )
         if resp.status_code == 200:
             return resp.json()['result']
-        logger.error(f"sendVideo failed: {resp.text[:200]}")
         return None
 
     # ================================================================== #
-    # Help messages
+    # Static messages
     # ================================================================== #
 
     async def _send_welcome_message(self, chat_id: int, user_id: int):
@@ -951,367 +1104,88 @@ class EnhancedSVGToTGSBot:
         plan    = get_plan(plan_id)
         used, _, remaining = self._usage_status(user_id, plan)
         rem_str = "Unlimited" if remaining == -1 else str(remaining)
+        price   = self.db.get_pro_price(default=PRO_PLAN.price_stars)
 
         text = (
-            "🎨 <b>SVG → TGS Converter</b>\n\n"
+            "🎨 <b>SVG / PNG → TGS Converter</b>\n\n"
             f"Your plan: {plan.emoji} <b>{plan.name}</b>\n"
             f"Used today: {used}  |  Remaining: {rem_str}\n\n"
-            "<b>Supported format:</b>\n"
-            "• SVG — must be exactly 512×512 px\n\n"
+            "<b>Supported formats:</b>\n"
+            "• SVG — must be exactly 512×512 px\n"
+            "• PNG — minimum 100×100 px\n\n"
             "<b>How to use:</b>\n"
-            f"1. Send up to {plan.batch_limit} SVG files\n"
-            "2. Receive your TGS stickers instantly!\n\n"
+            f"1. Send up to {plan.batch_limit} files\n"
+            f"2. Wait {int(BATCH_DELAY)}s after your last file\n"
+            "3. Receive your TGS stickers!\n\n"
             "<b>Commands:</b>\n"
             "/myplan     — Your plan & quota\n"
             "/mystats    — Your conversion stats\n"
             "/myhistory  — Last 10 conversions\n"
-            "/upgrade    — Go Pro (unlimited)\n"
+            f"/upgrade    — Go Pro ({price} ⭐/month)\n"
             "/help       — Full help"
         )
         await self.send_message(chat_id, text)
 
     async def _send_help_message(self, chat_id: int):
-        pro_price = self.db.get_effective_price('pro', PRO_PLAN.price_stars)
-        text = (
+        price = self.db.get_pro_price(default=PRO_PLAN.price_stars)
+        text  = (
             "<b>🔧 Help</b>\n\n"
             "<b>File requirements:</b>\n"
             "• SVG: exactly 512×512 px\n"
+            "• PNG: at least 100×100 px\n"
             "• Max 10 MB per file\n\n"
             "<b>Plans:</b>\n"
             f"🆓 Free — 5 conversions/day, batch up to {FREE_PLAN.batch_limit}\n"
             f"⭐ Pro  — Unlimited, batch up to {PRO_PLAN.batch_limit}, "
-            f"{pro_price} Stars/month\n\n"
-            "<b>User commands:</b>\n"
+            f"{price} ⭐ Stars/month\n\n"
+            "<b>Commands:</b>\n"
             "/start      — Welcome screen\n"
             "/myplan     — View your plan & quota\n"
             "/mystats    — Your stats\n"
             "/myhistory  — Last 10 conversions\n"
             "/upgrade    — Upgrade to Pro\n"
-            "/redeem     — Redeem an activation key\n"
             "/help       — This message"
         )
         await self.send_message(chat_id, text)
 
     async def _send_admin_help(self, chat_id: int):
-        pro_price = self.db.get_effective_price('pro', PRO_PLAN.price_stars)
-        text = (
+        price = self.db.get_pro_price(default=PRO_PLAN.price_stars)
+        text  = (
             "<b>🔑 Admin Commands</b>\n\n"
+            "<b>Plan management:</b>\n"
+            "/giveplan [id] [plan] [days]  — Grant plan to one user\n"
+            "/giveplanall [plan] [days]    — Grant plan to ALL users\n"
+            "/removeplan [id]              — Downgrade one user to Free\n"
+            "/removeplanall                — Revert only /giveplanall users to Free\n"
+            "                               (paid & individual giveplan NOT affected)\n\n"
+            "<b>Pricing:</b>\n"
+            f"/setprice [stars]             — Set Pro price (current: {price} ⭐)\n\n"
             "<b>User management:</b>\n"
             "/ban [id]                     — Ban user\n"
-            "/unban [id]                   — Unban user\n"
-            "/giveplan [id] [plan] [days]  — Grant plan to user\n"
-            "/removeplan [id]              — Downgrade to Free\n"
-            "/giveplanall [plan] [days]    — Grant plan to non-paid users\n"
-            "/removeplanall                — Downgrade non-paid users to Free\n\n"
+            "/unban [id]                   — Unban user\n\n"
             "<b>Stats & broadcast:</b>\n"
             "/stats                        — Bot statistics\n"
-            "/topusers                     — Top 10 active users\n"
-            "/broadcast [msg]              — Broadcast to all users\n\n"
-            f"<b>Pricing (current Pro: {pro_price} ⭐):</b>\n"
-            "/setprice [stars]             — Change Pro price (e.g. /setprice 100)\n\n"
+            "/broadcast [msg]              — Broadcast to all users\n"
+            "/adminhelp                    — This message\n\n"
             "<b>Owner only:</b>\n"
             "/makeadmin [id]               — Grant admin\n"
             "/removeadmin [id]             — Revoke admin\n\n"
             "<b>Examples:</b>\n"
             "<code>/giveplan 123456789 pro 30</code>\n"
+            "<code>/giveplan 123456789 pro</code>  (permanent)\n"
             "<code>/giveplanall pro 7</code>\n"
-            "<code>/removeplanall confirm</code>\n"
-            "<code>/setprice 100</code>\n"
-            "<code>/removeplan 123456789</code>"
+            "<code>/removeplanall</code>\n"
+            "<code>/setprice 50</code>"
         )
         await self.send_message(chat_id, text)
-
-
-    async def _handle_topusers(self, chat_id: int):
-        top = self.db.get_top_users(limit=10)
-        if not top:
-            await self.send_message(chat_id, "📭 No conversion data yet.")
-            return
-
-        medals = ["🥇", "🥈", "🥉"] + ["🔹"] * 7
-        lines  = ["🏆 <b>Top 10 Users by Conversions</b>\n"]
-        for i, u in enumerate(top):
-            medal   = medals[i] if i < len(medals) else "🔹"
-            name    = f"@{u['username']}" if u['username'] else u['first_name']
-            plan_e  = "⭐" if u['plan_id'] == 'pro' else "🆓"
-            lines.append(f"{medal} {i+1}. {name} {plan_e} — <b>{u['total']}</b> conversions")
-
-        await self.send_message(chat_id, "\n".join(lines))
-
-    # ================================================================== #
-    # /giveplanall
-    # ================================================================== #
-
-    async def _handle_giveplanall(self, chat_id: int, admin_id: int, parts: list):
-        """
-        /giveplanall [plan_id] [days]
-        Example: /giveplanall pro 7
-        Skips users who have already paid via Telegram Stars.
-        """
-        if len(parts) < 3:
-            await self.send_message(
-                chat_id,
-                "❌ Usage: /giveplanall [plan_id] [days]\n"
-                "Example: /giveplanall pro 7\n"
-                "Days range: 1–365\n\n"
-                "⚠️ Users who paid via Stars are NOT affected."
-            )
-            return
-        try:
-            plan_id = parts[1].lower()
-            if plan_id not in ('free', 'pro'):
-                await self.send_message(chat_id, "❌ plan_id must be 'free' or 'pro'.")
-                return
-
-            days = int(parts[2])
-            if not (1 <= days <= 365):
-                await self.send_message(chat_id, "❌ Days must be between 1 and 365.")
-                return
-
-            expires_at = datetime.now(timezone.utc) + timedelta(days=days)
-            pm = await self.send_message(chat_id, "⏳ Applying plan to users…")
-
-            updated, skipped = self.db.set_plan_all_users(
-                plan_id, expires_at, granted_by=admin_id, skip_paid=True
-            )
-            plan    = get_plan(plan_id)
-            exp_str = expires_at.strftime('%Y-%m-%d')
-
-            # Build per-plan notification message
-            if plan_id == 'pro':
-                user_msg = (
-                    f"🎉 <b>Plan Update!</b>\n\n"
-                    f"⭐ An admin has activated the <b>Pro</b> plan for you!\n"
-                    f"📅 Expires: <b>{exp_str}</b>\n\n"
-                    f"✅ Unlimited conversions\n"
-                    f"📦 Batch up to {plan.batch_limit} files\n\n"
-                    f"Use /myplan to see your quota. Enjoy! 🚀"
-                )
-            else:
-                user_msg = (
-                    f"ℹ️ <b>Plan Update!</b>\n\n"
-                    f"🆓 Your plan has been set to <b>Free</b> by an admin.\n"
-                    f"📅 Valid until: <b>{exp_str}</b>\n\n"
-                    f"📊 Daily limit: {plan.daily_limit} conversions\n"
-                    f"📦 Batch size: up to {plan.batch_limit} files\n\n"
-                    f"Use /upgrade to get Pro."
-                )
-
-            # Only notify users who were actually updated (not skipped)
-            updated_uids = self.db.get_users_without_paid_plan()
-            notified = 0
-            for uid in updated_uids:
-                if uid == admin_id:
-                    continue
-                try:
-                    await self.send_message(uid, user_msg)
-                    notified += 1
-                    await asyncio.sleep(0.05)
-                except Exception:
-                    pass
-
-            summary = (
-                f"✅ {plan.emoji} <b>{plan.name}</b> plan applied!\n\n"
-                f"👥 Updated  : <b>{updated}</b> users\n"
-                f"💳 Skipped  : <b>{skipped}</b> (paid users protected)\n"
-                f"📨 Notified : <b>{notified}</b> users\n"
-                f"📅 Expires  : <b>{exp_str}</b>"
-            )
-            if pm:
-                await self.edit_message(chat_id, pm['message_id'], summary)
-            else:
-                await self.send_message(chat_id, summary)
-
-            logger.info(
-                f"Admin {admin_id} gave {plan_id}/{days}d to {updated} users "
-                f"(skipped {skipped} paid), notified {notified}"
-            )
-        except ValueError:
-            await self.send_message(chat_id, "❌ Invalid days value. Use a number (1–365).")
-        except Exception as e:
-            logger.error(f"giveplanall error: {e}")
-            await self.send_message(chat_id, f"❌ Error: {e}")
-
-    # ================================================================== #
-    # /removeplanall
-    # ================================================================== #
-
-    async def _handle_removeplanall(self, chat_id: int, admin_id: int, parts: list):
-        """
-        /removeplanall
-        Downgrades ALL non-banned users (except paid Stars users) to Free.
-        Usage: /removeplanall        — with confirmation prompt
-               /removeplanall confirm — executes immediately
-        """
-        confirmed = len(parts) > 1 and parts[1].lower() == 'confirm'
-        if not confirmed:
-            total = len(self.db.get_all_users())
-            paid  = len(self.db.get_paid_user_ids())
-            await self.send_message(
-                chat_id,
-                f"⚠️ <b>Remove plan from ALL users?</b>\n\n"
-                f"👥 Total users   : <b>{total}</b>\n"
-                f"💳 Paid (skip)   : <b>{paid}</b> users will be protected\n"
-                f"🆓 Will downgrade: <b>{total - paid}</b> users to Free\n\n"
-                f"To confirm, send:\n<code>/removeplanall confirm</code>"
-            )
-            return
-
-        pm = await self.send_message(chat_id, "⏳ Removing plans…")
-        try:
-            updated, skipped = self.db.remove_plan_all_users(
-                granted_by=admin_id, skip_paid=True
-            )
-
-            user_msg = (
-                "ℹ️ <b>Plan Update!</b>\n\n"
-                "🆓 Your plan has been changed to <b>Free</b> by an admin.\n\n"
-                "📊 Daily limit: 5 conversions\n"
-                "📦 Batch up to 5 files\n\n"
-                "Use /upgrade to get Pro again."
-            )
-
-            downgraded_uids = self.db.get_users_without_paid_plan()
-            notified = 0
-            for uid in downgraded_uids:
-                if uid == admin_id:
-                    continue
-                try:
-                    await self.send_message(uid, user_msg)
-                    notified += 1
-                    await asyncio.sleep(0.05)
-                except Exception:
-                    pass
-
-            summary = (
-                f"✅ <b>Remove Plan All — Done!</b>\n\n"
-                f"🆓 Downgraded : <b>{updated}</b> users → Free\n"
-                f"💳 Skipped    : <b>{skipped}</b> paid users (protected)\n"
-                f"📨 Notified   : <b>{notified}</b> users"
-            )
-            if pm:
-                await self.edit_message(chat_id, pm['message_id'], summary)
-            else:
-                await self.send_message(chat_id, summary)
-
-            logger.info(
-                f"Admin {admin_id} removed plan from {updated} users "
-                f"(skipped {skipped} paid), notified {notified}"
-            )
-        except Exception as e:
-            logger.error(f"removeplanall error: {e}")
-            await self.send_message(chat_id, f"❌ Error: {e}")
-
-
-
-    async def _handle_redeem(self, chat_id: int, user_id: int, parts: list):
-        """
-        /redeem KEY123-ABCD-EFGH-IJKL
-        """
-        if len(parts) < 2:
-            await self.send_message(
-                chat_id,
-                "❌ Usage: /redeem [KEY]\nExample: /redeem ABCD-1234-EFGH-5678"
-            )
-            return
-
-        key = parts[1].strip().upper()
-        success, message, key_doc = self.db.redeem_key(key, user_id)
-
-        if success and key_doc:
-            plan    = get_plan(key_doc['plan_id'])
-            exp_str = (datetime.now(timezone.utc) +
-                       timedelta(days=key_doc['days'])).strftime('%Y-%m-%d')
-            await self.send_message(
-                chat_id,
-                f"🎉 <b>Key Redeemed Successfully!</b>\n\n"
-                f"{plan.emoji} Plan: <b>{plan.name}</b>\n"
-                f"⏳ Duration: <b>{key_doc['days']} days</b>\n"
-                f"📅 Expires: <b>{exp_str}</b>\n\n"
-                f"Enjoy your conversions! 🚀"
-            )
-        else:
-            await self.send_message(chat_id, message)
-
-    # ================================================================== #
-    # /setprice — change plan price dynamically
-    # ================================================================== #
-
-    async def _handle_setprice(self, chat_id: int, admin_id: int, parts: list):
-        """
-        /setprice [stars]
-        Example: /setprice 100
-        Always updates Pro plan price — no plan_id needed.
-        """
-        try:
-            pro_current = self.db.get_effective_price('pro', PRO_PLAN.price_stars)
-
-            if len(parts) < 2:
-                await self.send_message(
-                    chat_id,
-                    f"ℹ️ <b>Set Pro Plan Price</b>\n\n"
-                    f"Usage: /setprice [stars]\n"
-                    f"Example: /setprice 100\n\n"
-                    f"⭐ Current price: <b>{pro_current} Stars/month</b>"
-                )
-                return
-
-            stars = int(parts[1])
-            if stars < 1:
-                await self.send_message(chat_id, "❌ Price must be at least 1 Star.")
-                return
-            if stars > 10000:
-                await self.send_message(chat_id, "❌ Price cannot exceed 10 000 Stars.")
-                return
-
-            ok = self.db.set_plan_price('pro', stars, set_by=admin_id)
-            if ok:
-                await self.send_message(
-                    chat_id,
-                    f"✅ ⭐ <b>Pro</b> plan price updated!\n"
-                    f"Old price : <b>{pro_current} Stars/month</b>\n"
-                    f"New price : <b>{stars} Stars/month</b>\n\n"
-                    f"Next /upgrade invoice will charge <b>{stars} ⭐</b>."
-                )
-                logger.info(f"Admin {admin_id} set pro price {pro_current} → {stars} Stars")
-            else:
-                await self.send_message(chat_id, "❌ Failed to update price in database.")
-        except ValueError:
-            await self.send_message(chat_id, "❌ Invalid number. Example: /setprice 100")
-        except Exception as e:
-            logger.error(f"setprice error: {e}")
-            await self.send_message(chat_id, f"❌ Error: {e}")
-
-
-# Health-check HTTP server (keeps Render Web Service happy)
-# ======================================================================== #
-
-class _HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"OK")
-
-    def log_message(self, *args):
-        pass   # silence access logs
-
-
-def _start_health_server():
-    port = int(os.environ.get("PORT", 8080))
-    server = HTTPServer(("0.0.0.0", port), _HealthHandler)
-    t = threading.Thread(target=server.serve_forever, daemon=True)
-    t.start()
-    logger.info(f"Health-check server listening on port {port}")
 
 
 # ======================================================================== #
 
 async def main():
-    _start_health_server()
     bot = EnhancedSVGToTGSBot()
     await bot.start()
 
 
 if __name__ == '__main__':
     asyncio.run(main())
-
