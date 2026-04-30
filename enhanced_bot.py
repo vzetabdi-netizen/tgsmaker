@@ -10,7 +10,22 @@ Features:
   - /giveplan, /removeplan, /ban, /unban, /broadcast, /stats  (admin)
   - /makeadmin, /removeadmin  (owner only)
 """
+import os
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
+PORT = int(os.environ.get("PORT", 10000))
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b'Bot is running')
+
+def run_web():
+    server = HTTPServer(("0.0.0.0", PORT), Handler)
+    print(f"Web server running on port {PORT}")
+    server.serve_forever()
 import os
 import logging
 import requests
