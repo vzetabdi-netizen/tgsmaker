@@ -42,7 +42,6 @@ class Database:
         self.daily_usage      = self.db['daily_usage']
         self.conversions      = self.db['conversions']
         self.broadcasts       = self.db['broadcasts']
-        self.activation_keys  = self.db['activation_keys']
         self.plan_prices      = self.db['plan_prices']
 
         self._ensure_indexes()
@@ -58,7 +57,6 @@ class Database:
             )
             self.conversions.create_index('user_id')
             self.conversions.create_index('conversion_date')
-            self.activation_keys.create_index('key', unique=True)
             self.plan_prices.create_index('plan_id', unique=True)
         except Exception as e:
             logger.error(f"Index error: {e}")
@@ -198,12 +196,11 @@ class Database:
         Set a user's plan.
 
         grant_source is a marker indicating HOW the plan was granted, used by the
-        bulk admin commands (/giveplanall, /removeplanall) to avoid clobbering
+        bulk admin commands (/premiumall, /rpremiumall) to avoid clobbering
         plans that came from other sources. Known values:
             'payment'      — purchased via Telegram Stars
-            'giveplan'     — granted individually by an admin
-            'giveplanall'  — granted via the bulk admin command
-            'key'          — redeemed an activation key
+            'premium'      — granted individually by an admin via /premium
+            'premiumall'   — granted via the bulk admin command /premiumall
             'admin_remove' — explicitly downgraded by an admin
             None           — unspecified / legacy
         """
@@ -453,8 +450,8 @@ class Database:
     def _user_has_active_pro(self, uid: int, paid_ids: set) -> bool:
         """
         True if the user currently has an active Pro plan from ANY source —
-        a Stars payment, an individual /giveplan grant, an activation key,
-        or a previous /giveplanall that hasn't expired yet.
+        a Stars payment, an individual /premium grant, or a previous
+        /premiumall that hasn't expired yet.
         """
         if uid in paid_ids:
             return True
@@ -479,12 +476,12 @@ class Database:
         Bulk-grant a plan to every non-banned user who is currently on Free.
 
         Users are SKIPPED (left untouched) if they already have an active Pro
-        plan from ANY source — Stars payments, /giveplan grants, redeemed keys,
-        or previous /giveplanall grants that haven't expired. This ensures the
-        bulk command never downgrades or reschedules an existing Pro plan.
+        plan from ANY source — Stars payments, /premium grants, or previous
+        /premiumall grants that haven't expired. This ensures the bulk command
+        never downgrades or reschedules an existing Pro plan.
 
-        The new plan is tagged with grant_source='giveplanall' so that
-        /removeplanall can later remove ONLY plans granted this way.
+        The new plan is tagged with grant_source='premiumall' so that
+        /rpremiumall can later remove ONLY plans granted this way.
 
         Returns (count_updated, count_skipped, updated_user_ids).
         """
@@ -506,7 +503,7 @@ class Database:
                         'started_at':   now,
                         'expires_at':   expires_at,
                         'granted_by':   granted_by,
-                        'grant_source': 'giveplanall',
+                        'grant_source': 'premiumall',
                     }},
                     upsert=True
                 )
@@ -518,13 +515,12 @@ class Database:
 
     def remove_plan_all_users(self, granted_by: int) -> tuple[int, int, list[int]]:
         """
-        Bulk-revert ONLY the plans that were granted via /giveplanall.
+        Bulk-revert ONLY the plans that were granted via /premiumall.
 
         Plans coming from any other source are left untouched:
           - Stars payments
-          - Individual /giveplan grants
-          - Redeemed activation keys
-          - Anything with grant_source != 'giveplanall'
+          - Individual /premium grants
+          - Anything with grant_source != 'premiumall'
 
         Returns (count_updated, count_skipped, updated_user_ids).
         skipped = total non-banned users that were NOT downgraded.
@@ -533,11 +529,11 @@ class Database:
             total_users = self.users.count_documents({'is_banned': False})
 
             # Only target subscriptions explicitly tagged as bulk grants from
-            # /giveplanall. As an extra safety net, also confirm the user is
+            # /premiumall. As an extra safety net, also confirm the user is
             # not in the paid-users set before downgrading.
             paid_ids = self.get_paid_user_ids()
             target_docs = list(self.subscriptions.find(
-                {'grant_source': 'giveplanall'},
+                {'grant_source': 'premiumall'},
                 {'user_id': 1, '_id': 0}
             ))
 
@@ -547,7 +543,7 @@ class Database:
                 uid = doc['user_id']
                 if uid in paid_ids:
                     # Defense in depth: never downgrade a paying customer,
-                    # even if their record was somehow tagged as 'giveplanall'.
+                    # even if their record was somehow tagged as 'premiumall'.
                     continue
                 # Make sure this user still exists and is not banned.
                 u = self.users.find_one(
@@ -573,85 +569,6 @@ class Database:
         except Exception as e:
             logger.error(f"Error in remove_plan_all_users: {e}")
             return 0, 0, []
-
-    # ------------------------------------------------------------------ #
-    # Activation Keys
-    # ------------------------------------------------------------------ #
-
-    def create_activation_keys(self, keys: list, plan_id: str,
-                               days: int, created_by: int,
-                               max_uses: int = 1) -> int:
-        """Bulk-insert activation keys. Returns count inserted."""
-        from pymongo.errors import BulkWriteError
-        now  = datetime.now(timezone.utc)
-        docs = []
-        for k in keys:
-            docs.append({
-                'key':        k,
-                'plan_id':    plan_id,
-                'days':       days,
-                'max_uses':   max_uses,
-                'uses':       0,
-                'used_by':    [],
-                'created_by': created_by,
-                'created_at': now,
-                'active':     True,
-            })
-        if not docs:
-            return 0
-        try:
-            result = self.activation_keys.insert_many(docs, ordered=False)
-            return len(result.inserted_ids)
-        except BulkWriteError as bwe:
-            # ordered=False: partial inserts succeed; count what actually went in
-            inserted = bwe.details.get('nInserted', 0)
-            logger.warning(f"Partial key insert: {inserted}/{len(docs)} inserted (duplicates skipped)")
-            return inserted
-        except Exception as e:
-            logger.error(f"Error creating keys: {e}")
-            return 0
-
-    def redeem_key(self, key: str, user_id: int):
-        """
-        Redeem an activation key for a user.
-        Returns (success, message, key_doc).
-        """
-        try:
-            doc = self.activation_keys.find_one({'key': key})
-            if not doc:
-                return False, "❌ Key not found.", None
-            if not doc.get('active', True):
-                return False, "❌ This key has been deactivated.", None
-            if user_id in (doc.get('used_by') or []):
-                return False, "❌ You have already used this key.", None
-            if doc['uses'] >= doc['max_uses']:
-                return False, "❌ This key has already been fully used.", None
-
-            expires_at = datetime.now(timezone.utc) + timedelta(days=doc['days'])
-            self.set_user_plan(user_id, doc['plan_id'],
-                               expires_at=expires_at, granted_by=None,
-                               grant_source='key')
-
-            self.activation_keys.update_one(
-                {'key': key},
-                {
-                    '$inc': {'uses': 1},
-                    '$push': {'used_by': user_id},
-                    '$set': {'active': doc['uses'] + 1 < doc['max_uses']},
-                }
-            )
-            return True, "✅ Key redeemed!", doc
-
-        except Exception as e:
-            logger.error(f"Error redeeming key {key}: {e}")
-            return False, f"❌ Error: {e}", None
-
-    def get_key_info(self, key: str):
-        try:
-            return self.activation_keys.find_one({'key': key}, {'_id': 0})
-        except Exception as e:
-            logger.error(f"Error getting key info: {e}")
-            return None
 
     # ------------------------------------------------------------------ #
     # Dynamic Plan Pricing
