@@ -292,6 +292,7 @@ class Database:
             total_users        = self.users.count_documents({})
             active_users       = self.users.count_documents({'last_active': {'$gte': active_cutoff}})
             banned_users       = self.users.count_documents({'is_banned': True})
+            admin_users        = self.users.count_documents({'is_admin': True})
             pro_users          = self.subscriptions.count_documents({'plan_id': 'pro'})
             total_conversions  = self.conversions.count_documents({})
             success_conversions = self.conversions.count_documents({'success': True})
@@ -306,6 +307,7 @@ class Database:
                 'total_users':          total_users,
                 'active_users':         active_users,
                 'banned_users':         banned_users,
+                'admin_users':          admin_users,
                 'pro_users':            pro_users,
                 'total_conversions':    total_conversions,
                 'success_conversions':  success_conversions,

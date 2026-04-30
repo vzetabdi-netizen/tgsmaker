@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Enhanced Telegram Bot — SVG/PNG to TGS Conversion
+Enhanced Telegram Bot — SVG to TGS Conversion
 Features:
-  - SVG (512×512) and PNG (≥100×100) → TGS conversion
+  - SVG (512×512) → TGS conversion
   - Batch processing up to 15 files
   - Free plan  : 5 conversions/day
   - Pro plan   : unlimited, paid via Telegram Stars
@@ -10,22 +10,7 @@ Features:
   - /giveplan, /removeplan, /ban, /unban, /broadcast, /stats  (admin)
   - /makeadmin, /removeadmin  (owner only)
 """
-import os
-import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
 
-PORT = int(os.environ.get("PORT", 10000))
-
-class Handler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b'Bot is running')
-
-def run_web():
-    server = HTTPServer(("0.0.0.0", PORT), Handler)
-    print(f"Web server running on port {PORT}")
-    server.serve_forever()
 import os
 import logging
 import requests
@@ -36,7 +21,7 @@ from datetime import datetime, timedelta
 
 from database import Database
 from batch_converter import BatchConverter
-from svg_validator import SVGValidator, PNGValidator
+from svg_validator import SVGValidator
 from converter import SVGToTGSConverter
 from config import Config
 from plans import FREE_PLAN, PRO_PLAN, get_plan, format_plan_card, format_upgrade_message
@@ -47,8 +32,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Seconds to wait after the last file before processing the batch
-BATCH_DELAY = 3.0
+# Instant processing — effectively no delay
+BATCH_DELAY = 0.01
 
 
 class EnhancedSVGToTGSBot:
@@ -56,15 +41,14 @@ class EnhancedSVGToTGSBot:
         self.config = Config()
         self.db = Database()
         self.svg_validator = SVGValidator()
-        self.png_validator = PNGValidator()
         self.converter = SVGToTGSConverter()
         self.batch_converter = BatchConverter()
         self.base_url = f"https://api.telegram.org/bot{self.config.bot_token}"
         self.offset = 0
 
         # Batch state per user
-        self.user_files: dict[int, list]         = {}
-        self.user_timers: dict[int, asyncio.Task] = {}
+        self.user_files: dict[int, list]           = {}
+        self.user_timers: dict[int, asyncio.Task]  = {}
         self.user_waiting_message: dict[int, dict] = {}
 
         self._init_owner_admin()
@@ -74,7 +58,6 @@ class EnhancedSVGToTGSBot:
         if oid:
             self.db.add_user(oid, "Bot Owner", "Bot", "Owner")
             self.db.set_admin(oid, True)
-            # Give owner unlimited Pro
             self.db.set_user_plan(oid, 'pro', expires_at=None, granted_by=oid)
             logger.info(f"Owner {oid} initialised as admin with Pro plan")
 
@@ -83,7 +66,7 @@ class EnhancedSVGToTGSBot:
     # ================================================================== #
 
     async def start(self):
-        logger.info("Starting SVG/PNG → TGS bot…")
+        logger.info("Starting SVG → TGS bot…")
         try:
             me = await self._api_get("getMe")
             logger.info(f"Bot online: @{me.get('username', '?')}")
@@ -122,7 +105,6 @@ class EnhancedSVGToTGSBot:
 
     async def _handle_update(self, update: dict):
         try:
-            # ── Telegram Stars payment confirmation ──────────────────
             if 'pre_checkout_query' in update:
                 await self._answer_pre_checkout(update['pre_checkout_query'])
                 return
@@ -134,16 +116,13 @@ class EnhancedSVGToTGSBot:
             chat_id = msg['chat']['id']
             user_id = msg['from']['id']
 
-            # Register / update user
             u = msg['from']
             self.db.add_user(user_id, u.get('username'), u.get('first_name'), u.get('last_name'))
 
-            # Successful Stars payment received
             if 'successful_payment' in msg:
                 await self._handle_successful_payment(msg)
                 return
 
-            # Banned?
             if self.db.is_user_banned(user_id):
                 await self.send_message(chat_id, "🚫 You are banned from using this bot.")
                 return
@@ -167,7 +146,7 @@ class EnhancedSVGToTGSBot:
         chat_id = msg['chat']['id']
         user_id = msg['from']['id']
         parts   = text.split()
-        cmd     = parts[0].lower().split('@')[0]   # strip @botname suffix
+        cmd     = parts[0].lower().split('@')[0]
 
         # ── Public commands ─────────────────────────────────────────
         if cmd == '/start':
@@ -220,17 +199,15 @@ class EnhancedSVGToTGSBot:
         info    = self.db.get_subscription_info(user_id)
         used, _, remaining = self._usage_status(user_id, plan)
 
-        exp_str = "Never" if info.get('expires_at') is None else \
-                  info['expires_at'].strftime('%Y-%m-%d')
-
-        used_str      = str(used)
+        exp_str       = "Never" if info.get('expires_at') is None else \
+                        info['expires_at'].strftime('%Y-%m-%d')
         remaining_str = "Unlimited" if remaining == -1 else str(remaining)
         limit_str     = "Unlimited" if plan.daily_limit == -1 else str(plan.daily_limit)
 
         text = (
             f"{plan.emoji} <b>Your Plan: {plan.name}</b>\n\n"
             f"Daily limit   : {limit_str} conversions\n"
-            f"Used today    : {used_str}\n"
+            f"Used today    : {used}\n"
             f"Remaining     : {remaining_str}\n"
             f"Batch size    : up to {plan.batch_limit} files\n"
             f"Expires       : {exp_str}\n"
@@ -268,12 +245,12 @@ class EnhancedSVGToTGSBot:
 
         lines = ["📋 <b>Your Last 10 Conversions</b>\n"]
         for i, h in enumerate(history, 1):
-            status = "✅" if h['success'] else "❌"
-            name   = h.get('file_name') or 'unknown'
-            ftype  = (h.get('file_type') or 'svg').upper()
-            size   = h.get('file_size') or 0
-            date   = h['conversion_date'].strftime('%m-%d %H:%M') \
-                     if h.get('conversion_date') else '?'
+            status  = "✅" if h['success'] else "❌"
+            name    = h.get('file_name') or 'unknown'
+            ftype   = (h.get('file_type') or 'svg').upper()
+            size    = h.get('file_size') or 0
+            date    = h['conversion_date'].strftime('%m-%d %H:%M') \
+                      if h.get('conversion_date') else '?'
             size_kb = round(size / 1024, 1)
             lines.append(f"{i}. {status} <code>{name}</code> [{ftype}] {size_kb}KB — {date}")
 
@@ -294,49 +271,39 @@ class EnhancedSVGToTGSBot:
                 f"⭐ You are already on the <b>Pro</b> plan!\nExpires: {exp_str}"
             )
             return
-
-        # Send an invoice for Telegram Stars
         await self._send_stars_invoice(chat_id, user_id)
 
     async def _send_stars_invoice(self, chat_id: int, user_id: int):
-        """Send a Telegram Stars invoice for Pro plan (1 month)."""
         url  = f"{self.base_url}/sendInvoice"
         data = {
-            'chat_id':         chat_id,
-            'title':           '⭐ Pro Plan — 1 Month',
-            'description':     (
-                'Unlimited SVG & PNG to TGS conversions for 30 days. '
+            'chat_id':        chat_id,
+            'title':          '⭐ Pro Plan — 1 Month',
+            'description':    (
+                'Unlimited SVG to TGS conversions for 30 days. '
                 'Batch up to 15 files at once.'
             ),
-            'payload':         f'pro_1month_{user_id}',
-            'currency':        'XTR',          # Telegram Stars currency code
-            'prices':          f'[{{"label":"Pro Plan 1 Month","amount":{PRO_PLAN.price_stars}}}]',
-            'provider_token':  '',             # Empty string = Stars payment (no external provider)
+            'payload':        f'pro_1month_{user_id}',
+            'currency':       'XTR',
+            'prices':         f'[{{"label":"Pro Plan 1 Month","amount":{PRO_PLAN.price_stars}}}]',
+            'provider_token': '',
         }
         resp = await asyncio.to_thread(requests.post, url, data=data)
         if resp.status_code != 200:
             logger.error(f"sendInvoice failed: {resp.text}")
-            # Fallback — show manual upgrade info
-            await self.send_message(
-                chat_id,
-                format_upgrade_message(FREE_PLAN)
-            )
+            await self.send_message(chat_id, format_upgrade_message(FREE_PLAN))
 
     async def _answer_pre_checkout(self, pcq: dict):
-        """Always approve the checkout (validation happens in successful_payment)."""
         url  = f"{self.base_url}/answerPreCheckoutQuery"
         data = {'pre_checkout_query_id': pcq['id'], 'ok': True}
         await asyncio.to_thread(requests.post, url, data=data)
 
     async def _handle_successful_payment(self, msg: dict):
-        """Activate Pro plan after Stars payment is confirmed by Telegram."""
-        user_id  = msg['from']['id']
-        chat_id  = msg['chat']['id']
-        payment  = msg['successful_payment']
+        user_id   = msg['from']['id']
+        chat_id   = msg['chat']['id']
+        payment   = msg['successful_payment']
         charge_id = payment['telegram_payment_charge_id']
-        stars     = payment['total_amount']     # amount in Stars
+        stars     = payment['total_amount']
 
-        # Activate 30-day Pro plan
         expires = datetime.utcnow() + timedelta(days=30)
         self.db.set_user_plan(user_id, 'pro', expires_at=expires)
         self.db.log_payment(user_id, charge_id, stars, 'pro', status='completed')
@@ -359,7 +326,6 @@ class EnhancedSVGToTGSBot:
         """
         /giveplan [user_id] [plan_id] [days]
         days is optional; if omitted the plan never expires.
-        Example: /giveplan 123456 pro 30
         """
         if len(parts) < 3:
             await self.send_message(
@@ -377,19 +343,45 @@ class EnhancedSVGToTGSBot:
                 return
 
             expires_at = None
+            days_given = None
             if len(parts) >= 4:
-                days       = int(parts[3])
-                expires_at = datetime.utcnow() + timedelta(days=days)
+                days_given = int(parts[3])
+                expires_at = datetime.utcnow() + timedelta(days=days_given)
 
             self.db.set_user_plan(uid, plan_id, expires_at=expires_at, granted_by=admin_id)
 
-            exp_str = "Never (permanent)" if expires_at is None else expires_at.strftime('%Y-%m-%d')
             plan    = get_plan(plan_id)
+            exp_str = "Never (permanent)" if expires_at is None \
+                      else expires_at.strftime('%Y-%m-%d')
+
+            # Notify admin
             await self.send_message(
                 chat_id,
                 f"✅ {plan.emoji} <b>{plan.name}</b> plan granted to user <code>{uid}</code>\n"
                 f"Expires: {exp_str}"
             )
+
+            # Notify the user
+            if days_given is not None:
+                user_notif = (
+                    f"🎁 <b>Plan Update!</b>\n\n"
+                    f"An admin has given you the {plan.emoji} <b>{plan.name}</b> plan "
+                    f"for <b>{days_given} days</b>.\n"
+                    f"Expires: <b>{expires_at.strftime('%Y-%m-%d')}</b>\n\n"
+                    f"Enjoy your conversions! 🚀"
+                )
+            else:
+                user_notif = (
+                    f"🎁 <b>Plan Update!</b>\n\n"
+                    f"An admin has given you the {plan.emoji} <b>{plan.name}</b> plan "
+                    f"<b>permanently</b>.\n\n"
+                    f"Enjoy your conversions! 🚀"
+                )
+            try:
+                await self.send_message(uid, user_notif)
+            except Exception as e:
+                logger.warning(f"Could not notify user {uid} about plan grant: {e}")
+
             logger.info(f"Admin {admin_id} gave {plan_id} plan to user {uid} (expires {expires_at})")
 
         except ValueError:
@@ -405,10 +397,25 @@ class EnhancedSVGToTGSBot:
         try:
             uid = int(parts[1])
             self.db.set_user_plan(uid, 'free', expires_at=None, granted_by=admin_id)
+
+            # Notify admin
             await self.send_message(
                 chat_id,
                 f"✅ User <code>{uid}</code> has been downgraded to the Free plan."
             )
+
+            # Notify the user
+            try:
+                await self.send_message(
+                    uid,
+                    "⚠️ <b>Plan Update!</b>\n\n"
+                    "Your plan has been changed to 🆓 <b>Free</b> by an admin.\n\n"
+                    "Daily limit: 5 conversions/day.\n"
+                    "Use /upgrade to get Pro again."
+                )
+            except Exception as e:
+                logger.warning(f"Could not notify user {uid} about plan removal: {e}")
+
             logger.info(f"Admin {admin_id} removed plan from user {uid}")
         except ValueError:
             await self.send_message(chat_id, "❌ Invalid user ID.")
@@ -477,6 +484,7 @@ class EnhancedSVGToTGSBot:
                 f"👥 Total Users        : {s.get('total_users', 0)}\n"
                 f"🟢 Active (7 days)    : {s.get('active_users', 0)}\n"
                 f"🚫 Banned             : {s.get('banned_users', 0)}\n"
+                f"🔑 Admins             : {s.get('admin_users', 0)}\n"
                 f"⭐ Pro Users          : {s.get('pro_users', 0)}\n\n"
                 f"🔄 Total Conversions  : {s.get('total_conversions', 0)}\n"
                 f"✅ Successful         : {s.get('success_conversions', 0)}\n"
@@ -490,7 +498,7 @@ class EnhancedSVGToTGSBot:
             await self.send_message(chat_id, "❌ Error retrieving statistics.")
 
     async def _handle_broadcast_command(self, msg: dict):
-        chat_id = msg['chat']['id']
+        chat_id  = msg['chat']['id']
         admin_id = msg['from']['id']
 
         if 'reply_to_message' in msg:
@@ -521,10 +529,10 @@ class EnhancedSVGToTGSBot:
         elif bcast_msg.get('document'):
             media_file_id = bcast_msg['document']['file_id'];   media_type = 'document'
 
-        bcast_id    = self.db.log_broadcast(admin_id, bcast_msg.get('text', '[Media]'),
-                                            media_file_id, media_type)
-        progress    = await self.send_message(admin_chat_id,
-                                              f"📡 Broadcasting to {len(users)} users…")
+        bcast_id = self.db.log_broadcast(admin_id, bcast_msg.get('text', '[Media]'),
+                                         media_file_id, media_type)
+        progress = await self.send_message(admin_chat_id,
+                                           f"📡 Broadcasting to {len(users)} users…")
         sent = failed = 0
 
         for i, uid in enumerate(users):
@@ -551,19 +559,19 @@ class EnhancedSVGToTGSBot:
         if bcast_id:
             self.db.update_broadcast_count(bcast_id, sent)
 
-        rate = round(sent / len(users) * 100, 1) if users else 0
+        rate  = round(sent / len(users) * 100, 1) if users else 0
         final = (f"✅ <b>Broadcast done!</b>\n"
                  f"📤 Sent: {sent}  ❌ Failed: {failed}  📊 {rate}%")
         if progress:
             await self.edit_message(admin_chat_id, progress['message_id'], final)
 
     # ================================================================== #
-    # Document handling
+    # Document handling — SVG and ZIP only
     # ================================================================== #
 
     async def _handle_document(self, msg: dict):
-        chat_id  = msg['chat']['id']
-        doc      = msg['document']
+        chat_id = msg['chat']['id']
+        doc     = msg['document']
 
         if doc['file_size'] > self.config.max_file_size:
             mb = self.config.max_file_size // (1024 * 1024)
@@ -572,17 +580,14 @@ class EnhancedSVGToTGSBot:
 
         if self._is_svg_file(doc):
             await self._queue_file(msg, 'svg')
-        elif self._is_png_file(doc):
-            await self._queue_file(msg, 'png')
         elif (doc.get('mime_type') == 'application/zip' or
               doc.get('file_name', '').lower().endswith('.zip')):
             await self._handle_batch_zip(msg)
         else:
             await self.send_message(
                 chat_id,
-                "❌ Please send SVG or PNG files.\n"
-                "SVG: must be 512×512 px\n"
-                "PNG: must be at least 100×100 px"
+                "❌ Please send SVG files only.\n"
+                "SVG must be exactly 512×512 px."
             )
 
     @staticmethod
@@ -590,17 +595,11 @@ class EnhancedSVGToTGSBot:
         return (doc.get('mime_type') == 'image/svg+xml' or
                 doc.get('file_name', '').lower().endswith('.svg'))
 
-    @staticmethod
-    def _is_png_file(doc: dict) -> bool:
-        return (doc.get('mime_type') == 'image/png' or
-                doc.get('file_name', '').lower().endswith('.png'))
-
     # ================================================================== #
     # Batch queue
     # ================================================================== #
 
     def _usage_status(self, user_id: int, plan) -> tuple[int, int, int]:
-        """Returns (used_today, daily_limit, remaining).  remaining=-1 = unlimited."""
         _, used, remaining = self.db.check_daily_limit(user_id, plan.daily_limit)
         return used, plan.daily_limit, remaining
 
@@ -609,23 +608,20 @@ class EnhancedSVGToTGSBot:
         user_id = msg['from']['id']
         doc     = msg['document']
 
-        # ── Plan & rate-limit check ──────────────────────────────────
         plan_id = self.db.get_user_plan(user_id)
         plan    = get_plan(plan_id)
 
         allowed, used, remaining = self.db.check_daily_limit(user_id, plan.daily_limit)
         if not allowed:
-            limit_str = plan.daily_limit
             upgrade_hint = "\n\n💎 Upgrade to Pro for unlimited conversions — /upgrade" \
                            if plan_id == 'free' else ""
             await self.send_message(
                 chat_id,
-                f"⛔ You've reached your daily limit of <b>{limit_str}</b> conversions.\n"
+                f"⛔ You've reached your daily limit of <b>{plan.daily_limit}</b> conversions.\n"
                 f"Used today: {used}{upgrade_hint}"
             )
             return
 
-        # ── Batch size check ─────────────────────────────────────────
         if user_id not in self.user_files:
             self.user_files[user_id] = []
 
@@ -638,7 +634,6 @@ class EnhancedSVGToTGSBot:
             )
             return
 
-        # How many slots remain in today's quota vs batch limit?
         slots_by_quota = (remaining if remaining != -1 else plan.batch_limit) - pending
         if slots_by_quota <= 0:
             await self.send_message(
@@ -652,11 +647,10 @@ class EnhancedSVGToTGSBot:
             'file_type': file_type,
         })
 
-        # Show "Please wait…" only on the first file
+        # Show spinner only on the first file
         if len(self.user_files[user_id]) == 1:
             self.user_waiting_message[user_id] = await self.send_message(
-                chat_id,
-                f"⏳ Please wait {int(BATCH_DELAY)} seconds…"
+                chat_id, "⏳ Converting…"
             )
 
         # Reset timer on every new file
@@ -696,37 +690,32 @@ class EnhancedSVGToTGSBot:
         failed_count            = 0
 
         for i, fi in enumerate(files):
-            doc       = fi['document']
-            ftype     = fi['file_type']
-            suffix    = f'.{ftype}'
-            fname     = doc.get('file_name', f'file_{i+1}{suffix}')
+            doc   = fi['document']
+            fname = doc.get('file_name', f'file_{i+1}.svg')
 
             try:
-                fpath = await self._download_file(doc['file_id'], suffix=suffix)
+                fpath = await self._download_file(doc['file_id'], suffix='.svg')
                 try:
-                    # Validate
-                    if ftype == 'svg':
-                        ok, err = self.svg_validator.validate_svg_file(fpath)
-                    else:
-                        ok, err = self.png_validator.validate_png_file(fpath)
-
+                    ok, err = self.svg_validator.validate_svg_file(fpath)
                     if not ok:
                         failed_count += 1
+                        await self.send_message(chat_id, f"❌ <code>{fname}</code>: {err}")
                         self.db.add_conversion(user_id, fname, doc['file_size'],
-                                               success=False, file_type=ftype)
+                                               success=False, file_type='svg')
                         continue
 
                     tgs_path = await self.converter.convert(fpath)
                     tgs_name = Path(fname).stem + '.tgs'
                     successful.append({'tgs_path': tgs_path, 'filename': tgs_name})
                     self.db.add_conversion(user_id, fname, doc['file_size'],
-                                           success=True, file_type=ftype)
+                                           success=True, file_type='svg')
 
                 except Exception as e:
                     logger.error(f"Conversion error [{fname}]: {e}")
                     failed_count += 1
+                    await self.send_message(chat_id, f"❌ <code>{fname}</code>: Conversion failed.")
                     self.db.add_conversion(user_id, fname, doc['file_size'],
-                                           success=False, file_type=ftype)
+                                           success=False, file_type='svg')
                 finally:
                     if os.path.exists(fpath):
                         os.unlink(fpath)
@@ -735,11 +724,9 @@ class EnhancedSVGToTGSBot:
                 logger.error(f"Download error [{fname}]: {e}")
                 failed_count += 1
 
-        # Increment daily usage by number of successful conversions
         if successful:
             self.db.increment_today_usage(user_id, len(successful))
 
-        # Send converted files
         for conv in successful:
             try:
                 await self._send_document(chat_id, conv['tgs_path'], conv['filename'])
@@ -749,14 +736,13 @@ class EnhancedSVGToTGSBot:
                 if os.path.exists(conv['tgs_path']):
                     os.unlink(conv['tgs_path'])
 
-        # Update the "Please wait…" message
         if waiting_msg:
             try:
-                await self.edit_message(chat_id, waiting_msg['message_id'], "✅ Done — 100%")
+                await self.edit_message(chat_id, waiting_msg['message_id'], "✅ Done!")
             except Exception as e:
                 logger.error(f"edit_message error: {e}")
 
-        # Show remaining quota (only for Free users after processing)
+        # Quota reminder for Free users
         if plan_id == 'free' and successful:
             used_now = self.db.get_today_usage(user_id)
             left     = max(0, plan.daily_limit - used_now)
@@ -774,13 +760,13 @@ class EnhancedSVGToTGSBot:
                 )
 
     # ================================================================== #
-    # ZIP batch (legacy support)
+    # ZIP batch
     # ================================================================== #
 
     async def _handle_batch_zip(self, msg: dict):
-        chat_id  = msg['chat']['id']
-        user_id  = msg['from']['id']
-        doc      = msg['document']
+        chat_id = msg['chat']['id']
+        user_id = msg['from']['id']
+        doc     = msg['document']
 
         plan_id = self.db.get_user_plan(user_id)
         plan    = get_plan(plan_id)
@@ -794,7 +780,7 @@ class EnhancedSVGToTGSBot:
             return
 
         try:
-            pm = await self.send_message(chat_id, "🔄 Processing ZIP archive…")
+            pm    = await self.send_message(chat_id, "🔄 Processing ZIP archive…")
             zpath = await self._download_file(doc['file_id'], suffix='.zip')
 
             try:
@@ -855,9 +841,9 @@ class EnhancedSVGToTGSBot:
         return data['result']
 
     async def _download_file(self, file_id: str, suffix: str = '.tmp') -> str:
-        info     = await self._api_get("getFile", {'file_id': file_id})
-        dl_url   = f"https://api.telegram.org/file/bot{self.config.bot_token}/{info['file_path']}"
-        dl_resp  = await asyncio.to_thread(requests.get, dl_url, timeout=60)
+        info    = await self._api_get("getFile", {'file_id': file_id})
+        dl_url  = f"https://api.telegram.org/file/bot{self.config.bot_token}/{info['file_path']}"
+        dl_resp = await asyncio.to_thread(requests.get, dl_url, timeout=60)
         if dl_resp.status_code != 200:
             raise Exception(f"Download failed: {dl_resp.status_code}")
         fd, path = tempfile.mkstemp(suffix=suffix)
@@ -929,7 +915,7 @@ class EnhancedSVGToTGSBot:
         return None
 
     # ================================================================== #
-    # Static help messages
+    # Help messages
     # ================================================================== #
 
     async def _send_welcome_message(self, chat_id: int, user_id: int):
@@ -939,16 +925,14 @@ class EnhancedSVGToTGSBot:
         rem_str = "Unlimited" if remaining == -1 else str(remaining)
 
         text = (
-            "🎨 <b>SVG / PNG → TGS Converter</b>\n\n"
+            "🎨 <b>SVG → TGS Converter</b>\n\n"
             f"Your plan: {plan.emoji} <b>{plan.name}</b>\n"
             f"Used today: {used}  |  Remaining: {rem_str}\n\n"
-            "<b>Supported formats:</b>\n"
-            "• SVG — must be exactly 512×512 px\n"
-            f"• PNG — minimum 100×100 px\n\n"
+            "<b>Supported format:</b>\n"
+            "• SVG — must be exactly 512×512 px\n\n"
             "<b>How to use:</b>\n"
-            f"1. Send up to {plan.batch_limit} files\n"
-            f"2. Wait {int(BATCH_DELAY)}s after your last file\n"
-            "3. Receive your TGS stickers!\n\n"
+            f"1. Send up to {plan.batch_limit} SVG files\n"
+            "2. Receive your TGS stickers instantly!\n\n"
             "<b>Commands:</b>\n"
             "/myplan     — Your plan & quota\n"
             "/mystats    — Your conversion stats\n"
@@ -963,7 +947,6 @@ class EnhancedSVGToTGSBot:
             "<b>🔧 Help</b>\n\n"
             "<b>File requirements:</b>\n"
             "• SVG: exactly 512×512 px\n"
-            "• PNG: at least 100×100 px\n"
             "• Max 10 MB per file\n\n"
             "<b>Plans:</b>\n"
             f"🆓 Free — 5 conversions/day, batch up to {FREE_PLAN.batch_limit}\n"
