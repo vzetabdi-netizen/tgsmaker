@@ -161,6 +161,8 @@ class EnhancedSVGToTGSBot:
             await self._handle_myplan(chat_id, user_id)
         elif cmd == '/myhistory':
             await self._handle_myhistory(chat_id, user_id)
+        elif cmd == '/redeem':
+            await self._handle_redeem(chat_id, user_id, parts)
         elif cmd == '/mystats':
             await self._handle_mystats(chat_id, user_id)
 
@@ -184,6 +186,14 @@ class EnhancedSVGToTGSBot:
                 await self._handle_giveplan(chat_id, user_id, parts)
             elif cmd == '/removeplan' and len(parts) > 1:
                 await self._handle_removeplan(chat_id, user_id, parts)
+            elif cmd == '/topusers':
+                await self._handle_topusers(chat_id)
+            elif cmd == '/giveplanall':
+                await self._handle_giveplanall(chat_id, user_id, parts)
+            elif cmd == '/genkey':
+                await self._handle_genkey(chat_id, user_id, parts)
+            elif cmd == '/setprice':
+                await self._handle_setprice(chat_id, user_id, parts)
             elif cmd == '/adminhelp':
                 await self._send_admin_help(chat_id)
             else:
@@ -276,23 +286,25 @@ class EnhancedSVGToTGSBot:
         await self._send_stars_invoice(chat_id, user_id)
 
     async def _send_stars_invoice(self, chat_id: int, user_id: int):
-        url  = f"{self.base_url}/sendInvoice"
-        data = {
+        price = self.db.get_effective_price('pro', PRO_PLAN.price_stars)
+        url   = f"{self.base_url}/sendInvoice"
+        data  = {
             'chat_id':        chat_id,
             'title':          '⭐ Pro Plan — 1 Month',
             'description':    (
                 'Unlimited SVG to TGS conversions for 30 days. '
-                'Batch up to 15 files at once.'
+                'Batch up to 50 files at once.'
             ),
             'payload':        f'pro_1month_{user_id}',
             'currency':       'XTR',
-            'prices':         f'[{{"label":"Pro Plan 1 Month","amount":{PRO_PLAN.price_stars}}}]',
+            'prices':         f'[{{"label":"Pro Plan 1 Month","amount":{price}}}]',
             'provider_token': '',
         }
         resp = await asyncio.to_thread(requests.post, url, data=data)
         if resp.status_code != 200:
             logger.error(f"sendInvoice failed: {resp.text}")
-            await self.send_message(chat_id, format_upgrade_message(FREE_PLAN))
+            pro_price = self.db.get_effective_price('pro', PRO_PLAN.price_stars)
+            await self.send_message(chat_id, format_upgrade_message(FREE_PLAN, pro_price=pro_price))
 
     async def _answer_pre_checkout(self, pcq: dict):
         url  = f"{self.base_url}/answerPreCheckoutQuery"
@@ -945,6 +957,7 @@ class EnhancedSVGToTGSBot:
         await self.send_message(chat_id, text)
 
     async def _send_help_message(self, chat_id: int):
+        pro_price = self.db.get_effective_price('pro', PRO_PLAN.price_stars)
         text = (
             "<b>🔧 Help</b>\n\n"
             "<b>File requirements:</b>\n"
@@ -953,35 +966,44 @@ class EnhancedSVGToTGSBot:
             "<b>Plans:</b>\n"
             f"🆓 Free — 5 conversions/day, batch up to {FREE_PLAN.batch_limit}\n"
             f"⭐ Pro  — Unlimited, batch up to {PRO_PLAN.batch_limit}, "
-            f"{PRO_PLAN.price_stars} Stars/month\n\n"
+            f"{pro_price} Stars/month\n\n"
             "<b>User commands:</b>\n"
             "/start      — Welcome screen\n"
             "/myplan     — View your plan & quota\n"
             "/mystats    — Your stats\n"
             "/myhistory  — Last 10 conversions\n"
             "/upgrade    — Upgrade to Pro\n"
+            "/redeem     — Redeem an activation key\n"
             "/help       — This message"
         )
         await self.send_message(chat_id, text)
 
     async def _send_admin_help(self, chat_id: int):
+        pro_price = self.db.get_effective_price('pro', PRO_PLAN.price_stars)
         text = (
             "<b>🔑 Admin Commands</b>\n\n"
             "<b>User management:</b>\n"
-            "/ban [id]           — Ban user\n"
-            "/unban [id]         — Unban user\n"
-            "/giveplan [id] [plan] [days] — Grant a plan\n"
-            "/removeplan [id]    — Downgrade to Free\n\n"
+            "/ban [id]                     — Ban user\n"
+            "/unban [id]                   — Unban user\n"
+            "/giveplan [id] [plan] [days]  — Grant plan to user\n"
+            "/removeplan [id]              — Downgrade to Free\n"
+            "/giveplanall [plan] [days]    — Grant plan to ALL users\n\n"
             "<b>Stats & broadcast:</b>\n"
-            "/stats              — Bot statistics\n"
-            "/broadcast [msg]    — Broadcast to all users\n"
-            "/adminhelp          — This message\n\n"
+            "/stats                        — Bot statistics\n"
+            "/topusers                     — Top 10 active users\n"
+            "/broadcast [msg]              — Broadcast to all users\n\n"
+            "<b>Activation Keys:</b>\n"
+            "/genkey [plan] [days] [count] — Generate keys\n"
+            f"<b>Pricing (current Pro: {pro_price} ⭐):</b>\n"
+            "/setprice [plan] [stars]      — Change plan price\n\n"
             "<b>Owner only:</b>\n"
-            "/makeadmin [id]     — Grant admin\n"
-            "/removeadmin [id]   — Revoke admin\n\n"
+            "/makeadmin [id]               — Grant admin\n"
+            "/removeadmin [id]             — Revoke admin\n\n"
             "<b>Examples:</b>\n"
             "<code>/giveplan 123456789 pro 30</code>\n"
-            "<code>/giveplan 123456789 pro</code>  (permanent)\n"
+            "<code>/giveplanall pro 7</code>\n"
+            "<code>/genkey pro 30 100</code>\n"
+            "<code>/setprice pro 99</code>\n"
             "<code>/removeplan 123456789</code>"
         )
         await self.send_message(chat_id, text)
@@ -1019,3 +1041,245 @@ async def main():
 
 if __name__ == '__main__':
     asyncio.run(main())
+
+    # ================================================================== #
+    # /topusers
+    # ================================================================== #
+
+    async def _handle_topusers(self, chat_id: int):
+        top = self.db.get_top_users(limit=10)
+        if not top:
+            await self.send_message(chat_id, "📭 No conversion data yet.")
+            return
+
+        medals = ["🥇", "🥈", "🥉"] + ["🔹"] * 7
+        lines  = ["🏆 <b>Top 10 Users by Conversions</b>\n"]
+        for i, u in enumerate(top):
+            medal   = medals[i] if i < len(medals) else "🔹"
+            name    = f"@{u['username']}" if u['username'] else u['first_name']
+            plan_e  = "⭐" if u['plan_id'] == 'pro' else "🆓"
+            lines.append(f"{medal} {i+1}. {name} {plan_e} — <b>{u['total']}</b> conversions")
+
+        await self.send_message(chat_id, "\n".join(lines))
+
+    # ================================================================== #
+    # /giveplanall
+    # ================================================================== #
+
+    async def _handle_giveplanall(self, chat_id: int, admin_id: int, parts: list):
+        """
+        /giveplanall [plan_id] [days]
+        Example: /giveplanall pro 7
+        """
+        if len(parts) < 3:
+            await self.send_message(
+                chat_id,
+                "❌ Usage: /giveplanall [plan_id] [days]\n"
+                "Example: /giveplanall pro 7\n"
+                "Days range: 1–100"
+            )
+            return
+        try:
+            plan_id = parts[1].lower()
+            if plan_id not in ('free', 'pro'):
+                await self.send_message(chat_id, "❌ plan_id must be 'free' or 'pro'.")
+                return
+
+            days = int(parts[2])
+            if not (1 <= days <= 100):
+                await self.send_message(chat_id, "❌ Days must be between 1 and 100.")
+                return
+
+            from datetime import timezone, timedelta
+            expires_at = datetime.now(timezone.utc) + timedelta(days=days)
+            pm = await self.send_message(chat_id, "⏳ Applying plan to all users…")
+
+            count = self.db.set_plan_all_users(plan_id, expires_at, granted_by=admin_id)
+
+            plan    = get_plan(plan_id)
+            exp_str = expires_at.strftime('%Y-%m-%d')
+            summary = (
+                f"✅ {plan.emoji} <b>{plan.name}</b> plan granted to "
+                f"<b>{count}</b> users!\n"
+                f"Expires: <b>{exp_str}</b>"
+            )
+            if pm:
+                await self.edit_message(chat_id, pm['message_id'], summary)
+            else:
+                await self.send_message(chat_id, summary)
+
+            logger.info(f"Admin {admin_id} gave {plan_id}/{days}d to all {count} users")
+        except ValueError:
+            await self.send_message(chat_id, "❌ Invalid days value. Use a number (1–100).")
+
+    # ================================================================== #
+    # /genkey — generate activation keys
+    # ================================================================== #
+
+    async def _handle_genkey(self, chat_id: int, admin_id: int, parts: list):
+        """
+        /genkey [plan_id] [days] [count=1] [max_uses=1]
+        Examples:
+          /genkey pro 30
+          /genkey pro 30 5
+          /genkey pro 30 20000 1
+        """
+        if len(parts) < 3:
+            await self.send_message(
+                chat_id,
+                "❌ Usage: /genkey [plan] [days] [count] [max_uses]\n"
+                "Examples:\n"
+                "  /genkey pro 30        — 1 key, 30 days\n"
+                "  /genkey pro 30 5      — 5 keys\n"
+                "  /genkey pro 7 20000   — 20 000 keys\n"
+                "  /genkey pro 30 10 5   — 10 keys, each usable 5 times"
+            )
+            return
+        try:
+            import secrets, string
+            plan_id  = parts[1].lower()
+            if plan_id not in ('free', 'pro'):
+                await self.send_message(chat_id, "❌ plan_id must be 'free' or 'pro'.")
+                return
+
+            days      = int(parts[2])
+            count     = int(parts[3]) if len(parts) >= 4 else 1
+            max_uses  = int(parts[4]) if len(parts) >= 5 else 1
+
+            if not (1 <= days <= 365):
+                await self.send_message(chat_id, "❌ Days must be 1–365.")
+                return
+            if not (1 <= count <= 20000):
+                await self.send_message(chat_id, "❌ Count must be 1–20 000.")
+                return
+            if not (1 <= max_uses <= 1000):
+                await self.send_message(chat_id, "❌ Max uses must be 1–1000.")
+                return
+
+            pm = await self.send_message(chat_id, f"🔑 Generating {count} key(s)…")
+
+            alphabet = string.ascii_uppercase + string.digits
+            keys = []
+            while len(keys) < count:
+                k = ''.join(secrets.choice(alphabet) for _ in range(16))
+                k = f"{k[:4]}-{k[4:8]}-{k[8:12]}-{k[12:16]}"
+                keys.append(k)
+
+            inserted = self.db.create_activation_keys(
+                keys, plan_id, days, admin_id, max_uses
+            )
+            plan = get_plan(plan_id)
+
+            if count <= 20:
+                key_lines = "\n".join(f"<code>{k}</code>" for k in keys[:inserted])
+                msg = (
+                    f"✅ <b>{inserted} key(s) generated</b>\n"
+                    f"{plan.emoji} Plan: {plan.name} | Days: {days} | Max uses: {max_uses}\n\n"
+                    f"{key_lines}"
+                )
+            else:
+                # Send as a file for large batches
+                key_text = "\n".join(keys[:inserted])
+                fd, fpath = tempfile.mkstemp(suffix='.txt')
+                with os.fdopen(fd, 'w') as tf:
+                    tf.write(key_text)
+                fname = f"keys_{plan_id}_{days}d_{inserted}.txt"
+                msg = (
+                    f"✅ <b>{inserted} keys generated</b>\n"
+                    f"{plan.emoji} Plan: {plan.name} | Days: {days} | Max uses: {max_uses}\n"
+                    f"Keys saved to file below."
+                )
+                await self.send_message(chat_id, msg)
+                await self._send_document(chat_id, fpath, fname)
+                os.unlink(fpath)
+                if pm:
+                    await self.edit_message(chat_id, pm['message_id'], "✅ Keys generated!")
+                return
+
+            if pm:
+                await self.edit_message(chat_id, pm['message_id'], msg)
+            else:
+                await self.send_message(chat_id, msg)
+
+            logger.info(f"Admin {admin_id} generated {inserted} {plan_id}/{days}d keys")
+
+        except ValueError:
+            await self.send_message(chat_id, "❌ Invalid number. Check usage.")
+
+    # ================================================================== #
+    # /redeem — user redeems an activation key
+    # ================================================================== #
+
+    async def _handle_redeem(self, chat_id: int, user_id: int, parts: list):
+        """
+        /redeem KEY123-ABCD-EFGH-IJKL
+        """
+        if len(parts) < 2:
+            await self.send_message(
+                chat_id,
+                "❌ Usage: /redeem [KEY]\nExample: /redeem ABCD-1234-EFGH-5678"
+            )
+            return
+
+        key = parts[1].strip().upper()
+        success, message, key_doc = self.db.redeem_key(key, user_id)
+
+        if success and key_doc:
+            plan    = get_plan(key_doc['plan_id'])
+            exp_str = (datetime.now(timezone.utc) +
+                       timedelta(days=key_doc['days'])).strftime('%Y-%m-%d')
+            await self.send_message(
+                chat_id,
+                f"🎉 <b>Key Redeemed Successfully!</b>\n\n"
+                f"{plan.emoji} Plan: <b>{plan.name}</b>\n"
+                f"⏳ Duration: <b>{key_doc['days']} days</b>\n"
+                f"📅 Expires: <b>{exp_str}</b>\n\n"
+                f"Enjoy your conversions! 🚀"
+            )
+        else:
+            await self.send_message(chat_id, message)
+
+    # ================================================================== #
+    # /setprice — change plan price dynamically
+    # ================================================================== #
+
+    async def _handle_setprice(self, chat_id: int, admin_id: int, parts: list):
+        """
+        /setprice [plan_id] [stars]
+        Example: /setprice pro 99
+        """
+        if len(parts) < 3:
+            pro_current = self.db.get_effective_price('pro', PRO_PLAN.price_stars)
+            await self.send_message(
+                chat_id,
+                f"❌ Usage: /setprice [plan_id] [stars]\n"
+                f"Example: /setprice pro 99\n\n"
+                f"Current prices:\n"
+                f"⭐ Pro: <b>{pro_current} Stars/month</b>"
+            )
+            return
+        try:
+            plan_id = parts[1].lower()
+            if plan_id not in ('pro',):
+                await self.send_message(chat_id, "❌ Only 'pro' price can be changed.")
+                return
+
+            stars = int(parts[2])
+            if stars < 1:
+                await self.send_message(chat_id, "❌ Price must be at least 1 Star.")
+                return
+
+            ok = self.db.set_plan_price(plan_id, stars, set_by=admin_id)
+            if ok:
+                plan = get_plan(plan_id)
+                await self.send_message(
+                    chat_id,
+                    f"✅ {plan.emoji} <b>{plan.name}</b> plan price updated!\n"
+                    f"New price: <b>{stars} ⭐ Stars/month</b>\n\n"
+                    f"Next /upgrade invoice will use the new price."
+                )
+                logger.info(f"Admin {admin_id} set {plan_id} price to {stars} Stars")
+            else:
+                await self.send_message(chat_id, "❌ Failed to update price.")
+        except ValueError:
+            await self.send_message(chat_id, "❌ Invalid price. Use a number.")

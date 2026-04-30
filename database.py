@@ -33,12 +33,14 @@ class Database:
         db_name  = os.environ.get('MONGO_DB_NAME', 'svg_tgs_bot')
         self.db  = self.client[db_name]
 
-        self.users         = self.db['users']
-        self.subscriptions = self.db['subscriptions']
-        self.payments      = self.db['payments']
-        self.daily_usage   = self.db['daily_usage']
-        self.conversions   = self.db['conversions']
-        self.broadcasts    = self.db['broadcasts']
+        self.users            = self.db['users']
+        self.subscriptions    = self.db['subscriptions']
+        self.payments         = self.db['payments']
+        self.daily_usage      = self.db['daily_usage']
+        self.conversions      = self.db['conversions']
+        self.broadcasts       = self.db['broadcasts']
+        self.activation_keys  = self.db['activation_keys']
+        self.plan_prices      = self.db['plan_prices']
 
         self._ensure_indexes()
         logger.info(f"MongoDB connected — db: {db_name}")
@@ -53,6 +55,8 @@ class Database:
             )
             self.conversions.create_index('user_id')
             self.conversions.create_index('conversion_date')
+            self.activation_keys.create_index('key', unique=True)
+            self.activation_keys.create_index('used_by', sparse=True)
         except Exception as e:
             logger.error(f"Index error: {e}")
 
@@ -358,3 +362,167 @@ class Database:
             )
         except Exception as e:
             logger.error(f"Error updating broadcast count: {e}")
+
+    # ------------------------------------------------------------------ #
+    # Top Users
+    # ------------------------------------------------------------------ #
+
+    def get_top_users(self, limit: int = 10) -> list[dict]:
+        """Return top users ranked by total successful conversions."""
+        try:
+            pipeline = [
+                {'$match': {'success': True}},
+                {'$group': {'_id': '$user_id', 'total': {'$sum': 1}}},
+                {'$sort': {'total': -1}},
+                {'$limit': limit},
+            ]
+            rows = list(self.conversions.aggregate(pipeline))
+            result = []
+            for row in rows:
+                uid  = row['_id']
+                user = self.users.find_one({'user_id': uid},
+                                           {'username': 1, 'first_name': 1, '_id': 0})
+                sub  = self.subscriptions.find_one({'user_id': uid}, {'plan_id': 1, '_id': 0})
+                result.append({
+                    'user_id':    uid,
+                    'username':   (user or {}).get('username'),
+                    'first_name': (user or {}).get('first_name', 'User'),
+                    'plan_id':    (sub or {}).get('plan_id', 'free'),
+                    'total':      row['total'],
+                })
+            return result
+        except Exception as e:
+            logger.error(f"Error getting top users: {e}")
+            return []
+
+    # ------------------------------------------------------------------ #
+    # Give plan to ALL users
+    # ------------------------------------------------------------------ #
+
+    def set_plan_all_users(self, plan_id: str,
+                           expires_at, granted_by: int) -> int:
+        """Set plan for every non-banned user. Returns count updated."""
+        try:
+            user_ids = [d['user_id'] for d in
+                        self.users.find({'is_banned': False}, {'user_id': 1, '_id': 0})]
+            now = datetime.now(timezone.utc)
+            for uid in user_ids:
+                self.subscriptions.update_one(
+                    {'user_id': uid},
+                    {'$set': {
+                        'plan_id':    plan_id,
+                        'started_at': now,
+                        'expires_at': expires_at,
+                        'granted_by': granted_by,
+                    }},
+                    upsert=True
+                )
+            return len(user_ids)
+        except Exception as e:
+            logger.error(f"Error in set_plan_all_users: {e}")
+            return 0
+
+    # ------------------------------------------------------------------ #
+    # Activation Keys
+    # ------------------------------------------------------------------ #
+
+    def create_activation_keys(self, keys: list, plan_id: str,
+                               days: int, created_by: int,
+                               max_uses: int = 1) -> int:
+        """Bulk-insert activation keys. Returns count inserted."""
+        now  = datetime.now(timezone.utc)
+        docs = []
+        for k in keys:
+            docs.append({
+                'key':        k,
+                'plan_id':    plan_id,
+                'days':       days,
+                'max_uses':   max_uses,
+                'uses':       0,
+                'used_by':    [],
+                'created_by': created_by,
+                'created_at': now,
+                'active':     True,
+            })
+        try:
+            if docs:
+                self.activation_keys.insert_many(docs, ordered=False)
+            return len(docs)
+        except Exception as e:
+            logger.error(f"Error creating keys: {e}")
+            return 0
+
+    def redeem_key(self, key: str, user_id: int):
+        """
+        Redeem an activation key for a user.
+        Returns (success, message, key_doc).
+        """
+        try:
+            doc = self.activation_keys.find_one({'key': key})
+            if not doc:
+                return False, "❌ Key not found.", None
+            if not doc.get('active', True):
+                return False, "❌ This key has been deactivated.", None
+            if user_id in (doc.get('used_by') or []):
+                return False, "❌ You have already used this key.", None
+            if doc['uses'] >= doc['max_uses']:
+                return False, "❌ This key has already been fully used.", None
+
+            expires_at = datetime.now(timezone.utc) + timedelta(days=doc['days'])
+            self.set_user_plan(user_id, doc['plan_id'],
+                               expires_at=expires_at, granted_by=None)
+
+            self.activation_keys.update_one(
+                {'key': key},
+                {
+                    '$inc': {'uses': 1},
+                    '$push': {'used_by': user_id},
+                    '$set': {'active': doc['uses'] + 1 < doc['max_uses']},
+                }
+            )
+            return True, "✅ Key redeemed!", doc
+
+        except Exception as e:
+            logger.error(f"Error redeeming key {key}: {e}")
+            return False, f"❌ Error: {e}", None
+
+    def get_key_info(self, key: str):
+        try:
+            return self.activation_keys.find_one({'key': key}, {'_id': 0})
+        except Exception as e:
+            logger.error(f"Error getting key info: {e}")
+            return None
+
+    # ------------------------------------------------------------------ #
+    # Dynamic Plan Pricing
+    # ------------------------------------------------------------------ #
+
+    def get_plan_price(self, plan_id: str):
+        """Return override price in Stars, or None if no override set."""
+        try:
+            doc = self.plan_prices.find_one({'plan_id': plan_id})
+            return doc['price_stars'] if doc else None
+        except Exception as e:
+            logger.error(f"Error getting plan price: {e}")
+            return None
+
+    def set_plan_price(self, plan_id: str, price_stars: int, set_by: int) -> bool:
+        try:
+            self.plan_prices.update_one(
+                {'plan_id': plan_id},
+                {'$set': {
+                    'price_stars': price_stars,
+                    'set_by':      set_by,
+                    'updated_at':  datetime.now(timezone.utc),
+                }},
+                upsert=True
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Error setting plan price: {e}")
+            return False
+
+    def get_effective_price(self, plan_id: str, default_price: int) -> int:
+        """Return DB override price if set, else the default."""
+        override = self.get_plan_price(plan_id)
+        return override if override is not None else default_price

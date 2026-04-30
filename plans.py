@@ -1,6 +1,7 @@
 """
 Plans Module
 Defines Free and Pro plan limits, pricing, and Telegram Stars integration.
+Pricing can be overridden at runtime via /setprice (stored in DB).
 """
 
 from dataclasses import dataclass
@@ -16,7 +17,7 @@ class Plan:
     plan_id: str        # internal key: 'free' | 'pro'
     daily_limit: int    # max conversions per day  (-1 = unlimited)
     batch_limit: int    # max files per batch
-    price_stars: int    # Telegram Stars price per month (0 = free)
+    price_stars: int    # DEFAULT Telegram Stars price per month (0 = free)
     emoji: str
 
 
@@ -34,7 +35,7 @@ PRO_PLAN = Plan(
     plan_id     = "pro",
     daily_limit = -1,       # unlimited
     batch_limit = 50,
-    price_stars = 150,      # 150 Telegram Stars / month
+    price_stars = 150,      # default — can be overridden via /setprice
     emoji       = "⭐",
 )
 
@@ -53,9 +54,10 @@ def get_plan(plan_id: str) -> Plan:
 # Upgrade message helpers
 # ---------------------------------------------------------------------------
 
-def format_plan_card(plan: Plan) -> str:
+def format_plan_card(plan: Plan, effective_price: int | None = None) -> str:
     limit_str = "Unlimited" if plan.daily_limit == -1 else str(plan.daily_limit)
-    price_str = f"{plan.price_stars} ⭐ Stars/month" if plan.price_stars > 0 else "Free"
+    price = effective_price if effective_price is not None else plan.price_stars
+    price_str = f"{price} ⭐ Stars/month" if price > 0 else "Free"
     return (
         f"{plan.emoji} <b>{plan.name} Plan</b>\n"
         f"   • Daily conversions : {limit_str}\n"
@@ -64,14 +66,15 @@ def format_plan_card(plan: Plan) -> str:
     )
 
 
-def format_upgrade_message(current_plan: Plan) -> str:
+def format_upgrade_message(current_plan: Plan, pro_price: int | None = None) -> str:
+    effective = pro_price if pro_price is not None else PRO_PLAN.price_stars
     lines = [
         "💎 <b>Upgrade to Pro</b>\n",
         format_plan_card(FREE_PLAN),
         "",
-        format_plan_card(PRO_PLAN),
+        format_plan_card(PRO_PLAN, effective_price=effective),
         "",
-        f"👉 Pro costs only <b>{PRO_PLAN.price_stars} Telegram Stars</b> per month.",
+        f"👉 Pro costs only <b>{effective} Telegram Stars</b> per month.",
         "Stars are bought directly inside Telegram — no credit card needed.",
         "",
         "Tap /upgrade to pay and activate Pro instantly.",
