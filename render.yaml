@@ -1,5 +1,5 @@
 services:
-  - type: web
+  - type: worker
     name: svg-tgs-bot
     env: python
     plan: starter
