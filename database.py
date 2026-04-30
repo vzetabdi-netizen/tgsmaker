@@ -56,7 +56,7 @@ class Database:
             self.conversions.create_index('user_id')
             self.conversions.create_index('conversion_date')
             self.activation_keys.create_index('key', unique=True)
-            self.activation_keys.create_index('used_by', sparse=True)
+            self.plan_prices.create_index('plan_id', unique=True)
         except Exception as e:
             logger.error(f"Index error: {e}")
 
@@ -430,6 +430,7 @@ class Database:
                                days: int, created_by: int,
                                max_uses: int = 1) -> int:
         """Bulk-insert activation keys. Returns count inserted."""
+        from pymongo.errors import BulkWriteError
         now  = datetime.now(timezone.utc)
         docs = []
         for k in keys:
@@ -444,10 +445,16 @@ class Database:
                 'created_at': now,
                 'active':     True,
             })
+        if not docs:
+            return 0
         try:
-            if docs:
-                self.activation_keys.insert_many(docs, ordered=False)
-            return len(docs)
+            result = self.activation_keys.insert_many(docs, ordered=False)
+            return len(result.inserted_ids)
+        except BulkWriteError as bwe:
+            # ordered=False: partial inserts succeed; count what actually went in
+            inserted = bwe.details.get('nInserted', 0)
+            logger.warning(f"Partial key insert: {inserted}/{len(docs)} inserted (duplicates skipped)")
+            return inserted
         except Exception as e:
             logger.error(f"Error creating keys: {e}")
             return 0

@@ -1136,15 +1136,16 @@ if __name__ == '__main__':
             )
             return
         try:
-            import secrets, string
+            import secrets as _secrets
+            import string as _string
             plan_id  = parts[1].lower()
             if plan_id not in ('free', 'pro'):
                 await self.send_message(chat_id, "❌ plan_id must be 'free' or 'pro'.")
                 return
 
-            days      = int(parts[2])
-            count     = int(parts[3]) if len(parts) >= 4 else 1
-            max_uses  = int(parts[4]) if len(parts) >= 5 else 1
+            days     = int(parts[2])
+            count    = int(parts[3]) if len(parts) >= 4 else 1
+            max_uses = int(parts[4]) if len(parts) >= 5 else 1
 
             if not (1 <= days <= 365):
                 await self.send_message(chat_id, "❌ Days must be 1–365.")
@@ -1158,11 +1159,11 @@ if __name__ == '__main__':
 
             pm = await self.send_message(chat_id, f"🔑 Generating {count} key(s)…")
 
-            alphabet = string.ascii_uppercase + string.digits
+            alphabet = _string.ascii_uppercase + _string.digits
             keys = []
             while len(keys) < count:
-                k = ''.join(secrets.choice(alphabet) for _ in range(16))
-                k = f"{k[:4]}-{k[4:8]}-{k[8:12]}-{k[12:16]}"
+                raw = ''.join(_secrets.choice(alphabet) for _ in range(16))
+                k   = f"{raw[:4]}-{raw[4:8]}-{raw[8:12]}-{raw[12:16]}"
                 keys.append(k)
 
             inserted = self.db.create_activation_keys(
@@ -1170,41 +1171,54 @@ if __name__ == '__main__':
             )
             plan = get_plan(plan_id)
 
+            if inserted == 0:
+                final = "❌ Failed to save keys to database. Please try again."
+                if pm:
+                    await self.edit_message(chat_id, pm['message_id'], final)
+                else:
+                    await self.send_message(chat_id, final)
+                return
+
             if count <= 20:
+                # Show keys inline
                 key_lines = "\n".join(f"<code>{k}</code>" for k in keys[:inserted])
-                msg = (
+                final = (
                     f"✅ <b>{inserted} key(s) generated</b>\n"
                     f"{plan.emoji} Plan: {plan.name} | Days: {days} | Max uses: {max_uses}\n\n"
                     f"{key_lines}"
                 )
+                if pm:
+                    await self.edit_message(chat_id, pm['message_id'], final)
+                else:
+                    await self.send_message(chat_id, final)
             else:
-                # Send as a file for large batches
+                # Large batch — send as .txt file
                 key_text = "\n".join(keys[:inserted])
                 fd, fpath = tempfile.mkstemp(suffix='.txt')
-                with os.fdopen(fd, 'w') as tf:
-                    tf.write(key_text)
-                fname = f"keys_{plan_id}_{days}d_{inserted}.txt"
-                msg = (
-                    f"✅ <b>{inserted} keys generated</b>\n"
-                    f"{plan.emoji} Plan: {plan.name} | Days: {days} | Max uses: {max_uses}\n"
-                    f"Keys saved to file below."
-                )
-                await self.send_message(chat_id, msg)
-                await self._send_document(chat_id, fpath, fname)
-                os.unlink(fpath)
-                if pm:
-                    await self.edit_message(chat_id, pm['message_id'], "✅ Keys generated!")
-                return
-
-            if pm:
-                await self.edit_message(chat_id, pm['message_id'], msg)
-            else:
-                await self.send_message(chat_id, msg)
+                try:
+                    with os.fdopen(fd, 'w') as tf:
+                        tf.write(key_text)
+                    fname = f"keys_{plan_id}_{days}d_{inserted}.txt"
+                    summary = (
+                        f"✅ <b>{inserted} keys generated</b>\n"
+                        f"{plan.emoji} Plan: {plan.name} | Days: {days} | Max uses: {max_uses}"
+                    )
+                    if pm:
+                        await self.edit_message(chat_id, pm['message_id'], summary)
+                    else:
+                        await self.send_message(chat_id, summary)
+                    await self._send_document(chat_id, fpath, fname)
+                finally:
+                    if os.path.exists(fpath):
+                        os.unlink(fpath)
 
             logger.info(f"Admin {admin_id} generated {inserted} {plan_id}/{days}d keys")
 
         except ValueError:
             await self.send_message(chat_id, "❌ Invalid number. Check usage.")
+        except Exception as e:
+            logger.error(f"genkey error: {e}")
+            await self.send_message(chat_id, f"❌ Error generating keys: {e}")
 
     # ================================================================== #
     # /redeem — user redeems an activation key
@@ -1248,17 +1262,18 @@ if __name__ == '__main__':
         /setprice [plan_id] [stars]
         Example: /setprice pro 99
         """
-        if len(parts) < 3:
-            pro_current = self.db.get_effective_price('pro', PRO_PLAN.price_stars)
-            await self.send_message(
-                chat_id,
-                f"❌ Usage: /setprice [plan_id] [stars]\n"
-                f"Example: /setprice pro 99\n\n"
-                f"Current prices:\n"
-                f"⭐ Pro: <b>{pro_current} Stars/month</b>"
-            )
-            return
         try:
+            if len(parts) < 3:
+                pro_current = self.db.get_effective_price('pro', PRO_PLAN.price_stars)
+                await self.send_message(
+                    chat_id,
+                    f"ℹ️ Usage: /setprice [plan_id] [stars]\n"
+                    f"Example: /setprice pro 99\n\n"
+                    f"Current prices:\n"
+                    f"⭐ Pro: <b>{pro_current} Stars/month</b>"
+                )
+                return
+
             plan_id = parts[1].lower()
             if plan_id not in ('pro',):
                 await self.send_message(chat_id, "❌ Only 'pro' price can be changed.")
@@ -1267,6 +1282,9 @@ if __name__ == '__main__':
             stars = int(parts[2])
             if stars < 1:
                 await self.send_message(chat_id, "❌ Price must be at least 1 Star.")
+                return
+            if stars > 10000:
+                await self.send_message(chat_id, "❌ Price cannot exceed 10 000 Stars.")
                 return
 
             ok = self.db.set_plan_price(plan_id, stars, set_by=admin_id)
@@ -1280,6 +1298,9 @@ if __name__ == '__main__':
                 )
                 logger.info(f"Admin {admin_id} set {plan_id} price to {stars} Stars")
             else:
-                await self.send_message(chat_id, "❌ Failed to update price.")
+                await self.send_message(chat_id, "❌ Failed to update price in database.")
         except ValueError:
-            await self.send_message(chat_id, "❌ Invalid price. Use a number.")
+            await self.send_message(chat_id, "❌ Invalid price. Use a whole number e.g. /setprice pro 99")
+        except Exception as e:
+            logger.error(f"setprice error: {e}")
+            await self.send_message(chat_id, f"❌ Error: {e}")
