@@ -57,150 +57,89 @@ class EnhancedSVGToTGSBot:
             self.db.set_user_plan(oid, 'pro', expires_at=None, granted_by=oid)
             logger.info(f"Owner {oid} initialised as admin with Pro plan")
 
+    async def _handle_giveplan(self, chat_id: int, admin_id: int, parts: list):
+        """
+        /giveplan [user_id] [plan_id] [days]
+        Assigns a plan to a specific user.
+        """
+        if len(parts) < 3:
+            await self.send_message(
+                chat_id,
+                "❌ Usage: /giveplan [user_id] [plan_id] [days]\n"
+                "Example: /giveplan 123456789 pro 30\n"
+            )
+            return
+        try:
+            user_id = int(parts[1])
+            plan_id = parts[2].lower()
+            if plan_id not in ('free', 'pro'):
+                await self.send_message(chat_id, "❌ Invalid plan_id. Use 'free' or 'pro'.")
+                return
+
+            days = int(parts[3]) if len(parts) > 3 else None
+            expires_at = (
+                datetime.now(timezone.utc) + timedelta(days=days)
+                if days else None
+            )
+
+            self.db.set_user_plan(user_id, plan_id, expires_at=expires_at, granted_by=admin_id)
+
+            await self.send_message(
+                chat_id,
+                f"✅ Plan {plan_id.upper()} has been assigned to user {user_id}.\n"
+                f"Expires: {expires_at.strftime('%Y-%m-%d') if expires_at else 'Never'}"
+            )
+        except ValueError:
+            await self.send_message(chat_id, "❌ Invalid user ID or days.")
+
     async def _handle_giveplanall(self, chat_id: int, admin_id: int, parts: list):
         """
         /giveplanall [plan_id] [days]
-        Example: /giveplanall pro 7
-        Skips users who have already paid via Telegram Stars.
+        Assigns a plan to multiple users who are eligible.
         """
         if len(parts) < 3:
             await self.send_message(
                 chat_id,
                 "❌ Usage: /giveplanall [plan_id] [days]\n"
                 "Example: /giveplanall pro 7\n"
-                "Days range: 1–365\n\n"
-                "⚠️ Users who paid via Stars are NOT affected."
             )
             return
         try:
             plan_id = parts[1].lower()
-            if plan_id not in ('free', 'pro'):
-                await self.send_message(chat_id, "❌ plan_id must be 'free' or 'pro'.")
-                return
-
             days = int(parts[2])
-            if not (1 <= days <= 365):
-                await self.send_message(chat_id, "❌ Days must be between 1 and 365.")
+            if plan_id not in ('free', 'pro') or not (1 <= days <= 365):
+                await self.send_message(chat_id, "❌ Invalid plan_id or days.")
                 return
 
             expires_at = datetime.now(timezone.utc) + timedelta(days=days)
-            pm = await self.send_message(chat_id, "⏳ Applying plan to users…")
+            eligible_users = self.db.get_eligible_users()
 
-            updated, skipped = self.db.set_plan_all_users(
-                plan_id, expires_at, granted_by=admin_id, protect=['paid', 'manual']
-            )
-            plan    = get_plan(plan_id)
-            exp_str = expires_at.strftime('%Y-%m-%d')
-
-            if plan_id == 'pro':
-                user_msg = (
-                    f"🎉 <b>Plan Update!</b>\n\n"
-                    f"⭐ An admin has activated the <b>Pro</b> plan for you!\n"
-                    f"📅 Expires: <b>{exp_str}</b>\n\n"
-                    f"✅ Unlimited conversions\n"
-                    f"📦 Batch up to {plan.batch_limit} files\n\n"
-                    f"Use /myplan to see your quota. Enjoy! 🚀"
-                )
-            else:
-                user_msg = (
-                    f"ℹ️ <b>Plan Update!</b>\n\n"
-                    f"🆓 Your plan has been set to <b>Free</b> by an admin.\n"
-                    f"📅 Valid until: <b>{exp_str}</b>\n\n"
-                    f"📊 Daily limit: {plan.daily_limit} conversions\n"
-                    f"📦 Batch size: up to {plan.batch_limit} files\n\n"
-                    f"Use /upgrade to get Pro."
+            for user in eligible_users:
+                self.db.set_user_plan(
+                    user['id'], plan_id, expires_at=expires_at, granted_by=admin_id
                 )
 
-            updated_uids = self.db.get_users_without_plan('manual')
-            notified = 0
-            for uid in updated_uids:
-                if uid == admin_id:
-                    continue
-                try:
-                    await self.send_message(uid, user_msg)
-                    notified += 1
-                    await asyncio.sleep(0.05)
-                except Exception:
-                    pass
-
-            summary = (
-                f"✅ {plan.emoji} <b>{plan.name}</b> plan applied!\n\n"
-                f"👥 Updated  : <b>{updated}</b> users\n"
-                f"💳 Skipped  : <b>{skipped}</b> (manual and paid plans protected)\n"
-                f"📨 Notified : <b>{notified}</b> users\n"
-                f"📅 Expires  : <b>{exp_str}</b>"
-            )
-            if pm:
-                await self.edit_message(chat_id, pm['message_id'], summary)
-            else:
-                await self.send_message(chat_id, summary)
-
-            logger.info(
-                f"Admin {admin_id} gave {plan_id}/{days}d to {updated} users "
-                f"(skipped {skipped} protected), notified {notified}"
+            await self.send_message(
+                chat_id,
+                f"✅ Plan {plan_id.upper()} assigned to all eligible users.\n"
+                f"Expires: {expires_at.strftime('%Y-%m-%d')}"
             )
         except ValueError:
-            await self.send_message(chat_id, "❌ Invalid days value. Use a number (1–365).")
-        except Exception as e:
-            logger.error(f"giveplanall error: {e}")
-            await self.send_message(chat_id, f"❌ Error: {e}")
+            await self.send_message(chat_id, "❌ Invalid input.")
 
     async def _handle_removeplanall(self, chat_id: int, admin_id: int, parts: list):
         """
         /removeplanall
-        Command to downgrade users with manually assigned plans (not purchased).
-        Usage: /removeplanall        — with confirmation prompt
-               /removeplanall confirm — executes immediately
+        Removes a plan from all manually-assigned users.
         """
-        confirmed = len(parts) > 1 and parts[1].lower() == 'confirm'
-        if not confirmed:
-            total = self.db.get_manual_plan_user_count()
+        if len(parts) > 1 and parts[1].lower() == 'confirm':
+            self.db.remove_manual_plans(granted_by=admin_id)
+            await self.send_message(chat_id, "✅ All manually-assigned plans have been removed.")
+        else:
             await self.send_message(
                 chat_id,
-                f"⚠️ <b>Remove manual plans?</b>\n\n"
-                f"👥 Total manually assigned users : <b>{total}</b>\n"
-                f"To confirm, send:\n<code>/removeplanall confirm</code>"
-            )
-            return
-
-        pm = await self.send_message(chat_id, "⏳ Removing manual plans…")
-        try:
-            updated = self.db.remove_manual_plans(granted_by=admin_id)
-
-            user_msg = (
-                "ℹ️ <b>Plan Update!</b>\n\n"
-                "🆓 Your plan has been changed to <b>Free</b> by an admin.\n\n"
-                "📊 Daily limit: 5 conversions\n"
-                "📦 Batch up to 5 files\n\n"
-                "Use /upgrade to get Pro again."
+                "⚠️ Are you sure you want to remove all manually-assigned plans?\n"
+                "Send: /removeplanall confirm"
             )
 
-            notified = 0
-            for uid in self.db.get_users_with_plan_change():
-                if uid == admin_id:
-                    continue
-                try:
-                    await self.send_message(uid, user_msg)
-                    notified += 1
-                    await asyncio.sleep(0.05)
-                except Exception:
-                    pass
-
-            summary = (
-                f"✅ <b>Remove Manual Plans — Done!</b>\n\n"
-                f"🆓 Downgraded : <b>{updated}</b> users to Free\n"
-                f"📨 Notified   : <b>{notified}</b> users"
-            )
-            if pm:
-                await self.edit_message(chat_id, pm['message_id'], summary)
-            else:
-                await self.send_message(chat_id, summary)
-
-            logger.info(
-                f"Admin {admin_id} removed manual plans from {updated} users, notified {notified}"
-            )
-        except Exception as e:
-            logger.error(f"removeplanall error: {e}")
-            await self.send_message(chat_id, f"❌ Error: {e}")
-
-# Remaining existing code continues...
+# Remaining code unchanged...
