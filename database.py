@@ -307,6 +307,8 @@ class Database:
             ]))
             total_stars = stars_agg[0]['total'] if stars_agg else 0
 
+            pro_price = self.get_effective_price('pro', 150)
+
             return {
                 'total_users':          total_users,
                 'active_users':         active_users,
@@ -316,6 +318,7 @@ class Database:
                 'total_conversions':    total_conversions,
                 'success_conversions':  success_conversions,
                 'total_stars_earned':   total_stars,
+                'pro_price':            pro_price,
                 'success_rate': round(
                     (success_conversions / total_conversions * 100)
                     if total_conversions > 0 else 0, 2
@@ -399,14 +402,45 @@ class Database:
     # Give plan to ALL users
     # ------------------------------------------------------------------ #
 
+    def get_paid_user_ids(self) -> set:
+        """Return set of user_ids who have at least one completed Stars payment."""
+        try:
+            docs = self.payments.find({'status': 'completed'}, {'user_id': 1, '_id': 0})
+            return {d['user_id'] for d in docs}
+        except Exception as e:
+            logger.error(f"Error getting paid user ids: {e}")
+            return set()
+
+    def get_users_without_paid_plan(self) -> list[int]:
+        """Return non-banned user IDs who have never paid via Stars."""
+        try:
+            all_ids  = {d['user_id'] for d in
+                        self.users.find({'is_banned': False}, {'user_id': 1, '_id': 0})}
+            paid_ids = self.get_paid_user_ids()
+            return list(all_ids - paid_ids)
+        except Exception as e:
+            logger.error(f"Error getting non-paid users: {e}")
+            return []
+
     def set_plan_all_users(self, plan_id: str,
-                           expires_at, granted_by: int) -> int:
-        """Set plan for every non-banned user. Returns count updated."""
+                           expires_at, granted_by: int,
+                           skip_paid: bool = True) -> tuple[int, int]:
+        """
+        Set plan for every non-banned user.
+        If skip_paid=True, users who have ever paid via Stars are not downgraded/changed.
+        Returns (count_updated, count_skipped).
+        """
         try:
             user_ids = [d['user_id'] for d in
                         self.users.find({'is_banned': False}, {'user_id': 1, '_id': 0})]
+            paid_ids = self.get_paid_user_ids() if skip_paid else set()
             now = datetime.now(timezone.utc)
+            updated = 0
+            skipped = 0
             for uid in user_ids:
+                if skip_paid and uid in paid_ids:
+                    skipped += 1
+                    continue
                 self.subscriptions.update_one(
                     {'user_id': uid},
                     {'$set': {
@@ -417,10 +451,45 @@ class Database:
                     }},
                     upsert=True
                 )
-            return len(user_ids)
+                updated += 1
+            return updated, skipped
         except Exception as e:
             logger.error(f"Error in set_plan_all_users: {e}")
-            return 0
+            return 0, 0
+
+    def remove_plan_all_users(self, granted_by: int,
+                              skip_paid: bool = True) -> tuple[int, int]:
+        """
+        Downgrade every non-banned user to Free plan.
+        If skip_paid=True, users who have paid via Stars are not touched.
+        Returns (count_updated, count_skipped).
+        """
+        try:
+            user_ids = [d['user_id'] for d in
+                        self.users.find({'is_banned': False}, {'user_id': 1, '_id': 0})]
+            paid_ids = self.get_paid_user_ids() if skip_paid else set()
+            now = datetime.now(timezone.utc)
+            updated = 0
+            skipped = 0
+            for uid in user_ids:
+                if skip_paid and uid in paid_ids:
+                    skipped += 1
+                    continue
+                self.subscriptions.update_one(
+                    {'user_id': uid},
+                    {'$set': {
+                        'plan_id':    'free',
+                        'started_at': now,
+                        'expires_at': None,
+                        'granted_by': granted_by,
+                    }},
+                    upsert=True
+                )
+                updated += 1
+            return updated, skipped
+        except Exception as e:
+            logger.error(f"Error in remove_plan_all_users: {e}")
+            return 0, 0
 
     # ------------------------------------------------------------------ #
     # Activation Keys

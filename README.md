@@ -1,75 +1,150 @@
-# SVG / PNG to TGS — Telegram Bot
+# SVG to TGS — Telegram Bot
 
-A production-ready Telegram bot that converts **SVG** and **PNG** files to **TGS** (Telegram animated sticker) format, with a full **Free / Pro** subscription system powered by **Telegram Stars**.
+A production-ready Telegram bot that converts **SVG** files to **TGS** (Telegram animated sticker) format, with a full **Free / Pro** subscription system powered by **Telegram Stars**.
 
 ---
 
-## Features
+## Plans & Limits
 
-| Feature | Free | Pro |
+| Feature | Free 🆓 | Pro ⭐ |
 |---|---|---|
 | SVG → TGS (512×512 px) | ✅ | ✅ |
-| PNG → TGS (≥100×100 px) | ✅ | ✅ |
 | Daily conversions | 5 | Unlimited |
-| Batch size | 5 files | 15 files |
+| Batch size (files at once) | 5 files | 50 files |
 | ZIP archive upload | ✅ | ✅ |
-| Price | Free | 150 ⭐ Stars / month |
+| Conversion history | ✅ | ✅ |
+| Price | Free | 150 ⭐ Stars/month (adjustable) |
 
-### Admin features
-- `/broadcast` — text, photo, video, or document to all users
-- `/ban` / `/unban` — user management
-- `/giveplan` / `/removeplan` — manually grant or revoke plans
-- `/makeadmin` / `/removeadmin` — owner-only privilege management
-- `/stats` — live bot statistics (users, conversions, Stars earned)
+> **Note:** PNG conversion is **not supported**. Only SVG files (exactly 512×512 px) are accepted.
 
-### User commands
+---
+
+## User Commands
+
 | Command | Description |
 |---|---|
-| `/start` | Welcome screen with current quota |
-| `/myplan` | Active plan, daily limit & remaining |
-| `/mystats` | Personal conversion statistics |
-| `/myhistory` | Last 10 conversions |
-| `/upgrade` | Pay via Telegram Stars and activate Pro |
-| `/help` | Full help message |
+| `/start` | Welcome screen — shows your plan and remaining quota |
+| `/myplan` | Active plan, daily limit, remaining conversions, expiry date |
+| `/mystats` | Personal stats: total, successful, failed conversions |
+| `/myhistory` | Last 10 conversions with file name, size, and date |
+| `/upgrade` | Pay via Telegram Stars and activate Pro instantly |
+| `/redeem [KEY]` | Redeem an activation key given by an admin |
+| `/help` | Full help message with file requirements and plan info |
+
+---
+
+## Admin Commands
+
+| Command | Description |
+|---|---|
+| `/stats` | Live bot stats — users, conversions, Stars earned, current Pro price |
+| `/broadcast [msg]` | Send text, photo, video, or document to all users |
+| `/ban [user_id]` | Ban a user |
+| `/unban [user_id]` | Unban a user |
+| `/giveplan [id] [plan] [days]` | Grant a plan to a specific user (days optional = permanent) |
+| `/removeplan [user_id]` | Downgrade a specific user to Free |
+| `/giveplanall [plan] [days]` | Grant a plan to all non-paid users (paid Stars users are protected) |
+| `/removeplanall` | Downgrade all non-paid users to Free (requires `/removeplanall confirm`) |
+| `/topusers` | Top 10 users by total successful conversions |
+| `/setprice [stars]` | Change the Pro plan price (e.g. `/setprice 100`) |
+| `/adminhelp` | Admin command reference |
+
+### Owner-only Commands
+
+| Command | Description |
+|---|---|
+| `/makeadmin [user_id]` | Grant admin privileges |
+| `/removeadmin [user_id]` | Revoke admin privileges |
+
+> **Paid user protection:** `/giveplanall` and `/removeplanall` never touch users who have paid via Telegram Stars. Their plans are always preserved.
+
+---
+
+## Admin Command Examples
+
+```
+/stats
+/broadcast Hello everyone! New feature released.
+/ban 123456789
+/unban 123456789
+/giveplan 123456789 pro 30        — Pro for 30 days
+/giveplan 123456789 pro           — Pro permanently
+/removeplan 123456789
+/giveplanall pro 7                — Pro for 7 days to all non-paid users
+/removeplanall                    — Shows confirmation prompt
+/removeplanall confirm            — Executes downgrade
+/setprice 100                     — Set Pro to 100 Stars/month
+/makeadmin 123456789              — Owner only
+/removeadmin 123456789            — Owner only
+```
+
+---
+
+## Payment Flow (Telegram Stars)
+
+1. User runs `/upgrade`
+2. Bot sends a Telegram Stars invoice
+3. User pays inside Telegram — no external redirect needed
+4. Telegram sends `successful_payment` to the bot
+5. Bot activates Pro plan for 30 days and notifies the user
+6. Plan auto-expires; user returns to Free automatically
+
+Paid users are **permanently protected** — `/giveplanall` and `/removeplanall` will never override their subscription.
+
+To test payments: `@BotFather → Payments → Test Mode`
+
+---
+
+## File Requirements
+
+| Type | Requirement |
+|---|---|
+| SVG | Exactly **512×512** pixels, valid XML, ≤ 1 MB, ≤ 1000 elements |
+| ZIP | Must contain `.svg` files inside; non-SVG files are ignored |
+| Both | Maximum **10 MB** per upload |
 
 ---
 
 ## Architecture
 
 ```
-enhanced_bot.py   — Main bot (polling, command router, premium logic)
-converter.py      — SVG & PNG → TGS conversion engine
-batch_converter.py— Concurrent batch conversion + ZIP extraction
-svg_validator.py  — SVGValidator (512×512) + PNGValidator (≥100×100)
-database.py       — PostgreSQL: users, subscriptions, payments, usage, history
-plans.py          — Plan definitions, pricing, helper formatters
-config.py         — Environment variable loader
+enhanced_bot.py    — Main bot: polling loop, command router, plan logic, payments
+converter.py       — SVG → TGS conversion engine (in-process lottie, subprocess fallback)
+batch_converter.py — Concurrent batch conversion + ZIP extraction
+svg_validator.py   — SVG validation (512×512, ≤1MB, ≤1000 elements)
+database.py        — MongoDB: users, subscriptions, payments, usage, history, keys, pricing
+plans.py           — Plan definitions (Free/Pro), pricing helpers
+config.py          — Environment variable loader (BOT_TOKEN, DATABASE_URL, OWNER_ID)
 ```
+
+**Database:** MongoDB (via `pymongo`) — hosted on MongoDB Atlas or any MongoDB provider.
 
 ---
 
 ## Quick Start
 
 ### Prerequisites
+
 - Python 3.11+
-- PostgreSQL database
+- MongoDB database (MongoDB Atlas free tier works)
 - Telegram Bot Token from [@BotFather](https://t.me/BotFather)
-- (For Stars payments) Enable payments in BotFather → Payments → Telegram Stars
+- Telegram Stars payments enabled in BotFather
 
 ### Environment Variables
 
 | Variable | Required | Description |
 |---|---|---|
-| `BOT_TOKEN` | ✅ | Telegram bot token |
-| `DATABASE_URL` | ✅ | PostgreSQL connection string |
-| `OWNER_ID` | ✅ | Your Telegram user ID (gets auto-Pro + owner admin) |
+| `BOT_TOKEN` | ✅ | Telegram bot token from @BotFather |
+| `DATABASE_URL` | ✅ | MongoDB connection string (e.g. `mongodb+srv://...`) |
+| `OWNER_ID` | ✅ | Your Telegram user ID — gets auto Pro + owner admin rights |
+| `MONGO_DB_NAME` | ❌ | MongoDB database name (default: `svg_tgs_bot`) |
 
 ### Installation
 
 ```bash
 git clone <your-repo-url>
 cd svg-to-tgs-bot
-pip install -r deploy-requirements.txt
+pip install -r requirements.txt
 ```
 
 Set your environment variables, then:
@@ -80,68 +155,59 @@ python enhanced_bot.py
 
 ---
 
-## Deployment
-
-### Render (recommended)
-
-1. Create a new **Web Service** on [Render](https://render.com)
-2. Connect your GitHub repository
-3. Settings:
-   - **Build**: `pip install -r deploy-requirements.txt`
-   - **Start**: `python enhanced_bot.py`
-4. Add environment variables in the Render dashboard
-5. Add a **PostgreSQL** database and link `DATABASE_URL`
+## Deployment on Render
 
 A `render.yaml` is included for one-click deploy.
 
-### Heroku
+1. Go to [render.com](https://render.com) → **New → Blueprint**
+2. Connect your GitHub repository
+3. Render detects `render.yaml` and creates the Web Service
+4. Add your secret environment variables in the Render dashboard:
+
+| Key | Value |
+|---|---|
+| `BOT_TOKEN` | Your bot token |
+| `DATABASE_URL` | Your MongoDB Atlas connection string |
+| `OWNER_ID` | Your Telegram user ID |
+
+5. Click **Save Changes** — Render redeploys automatically
+
+**Build command:** `pip install --upgrade pip && pip install -r requirements.txt`  
+**Start command:** `python enhanced_bot.py`
+
+> The bot runs as a **Web Service** on Render (includes a built-in `/health` endpoint to keep it alive). The Starter plan ($7/mo) is required — the free tier does not support always-on services.
+
+---
+
+## Updating the Bot
+
+Every `git push` triggers an automatic redeploy on Render:
 
 ```bash
-heroku create
-heroku addons:create heroku-postgresql:mini
-heroku config:set BOT_TOKEN=... OWNER_ID=...
-git push heroku main
+git add .
+git commit -m "your change"
+git push
 ```
 
 ---
 
-## Payment Flow (Telegram Stars)
+## Troubleshooting
 
-1. User runs `/upgrade`
-2. Bot sends a Telegram Stars invoice (150 ⭐)
-3. User pays inside Telegram — no external redirect
-4. Telegram sends `successful_payment` to the bot
-5. Bot activates Pro plan for 30 days in the database
-6. Plan auto-expires and user returns to Free after 30 days
+**Bot not responding**
+- Check Render Logs for errors
+- Confirm `BOT_TOKEN` is correct in Environment settings
 
-To test payments use `@BotFather → Payments → Test Mode`.
+**Database connection errors**
+- Confirm `DATABASE_URL` is a valid MongoDB URI
+- Make sure your MongoDB Atlas cluster allows connections from Render (set IP to `0.0.0.0/0` in Atlas Network Access)
 
----
+**lottie / conversion errors**
+- `lottie[all]` in `requirements.txt` installs both the Python library and `lottie_convert.py`
+- The bot tries in-process conversion first (fast), then falls back to subprocess automatically
 
-## Admin Command Reference
-
-```
-/stats                          — Bot statistics
-/broadcast Hello everyone!      — Text broadcast
-/ban 123456789                  — Ban a user
-/unban 123456789                — Unban a user
-/giveplan 123456789 pro 30      — Give Pro for 30 days
-/giveplan 123456789 pro         — Give Pro permanently
-/removeplan 123456789           — Downgrade to Free
-/makeadmin 123456789            — Grant admin (owner only)
-/removeadmin 123456789          — Revoke admin (owner only)
-/adminhelp                      — Admin command list
-```
-
----
-
-## File Requirements
-
-| Type | Requirement |
-|---|---|
-| SVG | Exactly 512×512 pixels, valid XML, ≤1 MB, ≤1000 elements |
-| PNG | At least 100×100 pixels, valid PNG signature |
-| Both | Maximum 10 MB file size |
+**Payment invoice not sending**
+- Confirm Telegram Stars is enabled in BotFather → Payments
+- Check Render Logs for `sendInvoice failed`
 
 ---
 
