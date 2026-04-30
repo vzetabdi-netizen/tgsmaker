@@ -190,8 +190,6 @@ class EnhancedSVGToTGSBot:
                 await self._handle_topusers(chat_id)
             elif cmd == '/giveplanall':
                 await self._handle_giveplanall(chat_id, user_id, parts)
-            elif cmd == '/genkey':
-                await self._handle_genkey(chat_id, user_id, parts)
             elif cmd == '/setprice':
                 await self._handle_setprice(chat_id, user_id, parts)
             elif cmd == '/adminhelp':
@@ -992,18 +990,15 @@ class EnhancedSVGToTGSBot:
             "/stats                        — Bot statistics\n"
             "/topusers                     — Top 10 active users\n"
             "/broadcast [msg]              — Broadcast to all users\n\n"
-            "<b>Activation Keys:</b>\n"
-            "/genkey [plan] [days] [count] — Generate keys\n"
             f"<b>Pricing (current Pro: {pro_price} ⭐):</b>\n"
-            "/setprice [plan] [stars]      — Change plan price\n\n"
+            "/setprice [stars]             — Change Pro price (e.g. /setprice 100)\n\n"
             "<b>Owner only:</b>\n"
             "/makeadmin [id]               — Grant admin\n"
             "/removeadmin [id]             — Revoke admin\n\n"
             "<b>Examples:</b>\n"
             "<code>/giveplan 123456789 pro 30</code>\n"
             "<code>/giveplanall pro 7</code>\n"
-            "<code>/genkey pro 30 100</code>\n"
-            "<code>/setprice pro 99</code>\n"
+            "<code>/setprice 100</code>\n"
             "<code>/removeplan 123456789</code>"
         )
         await self.send_message(chat_id, text)
@@ -1033,6 +1028,7 @@ class EnhancedSVGToTGSBot:
         """
         /giveplanall [plan_id] [days]
         Example: /giveplanall pro 7
+        Sends each user a notification matching their new plan.
         """
         if len(parts) < 3:
             await self.send_message(
@@ -1053,135 +1049,61 @@ class EnhancedSVGToTGSBot:
                 await self.send_message(chat_id, "❌ Days must be between 1 and 100.")
                 return
 
-            from datetime import timezone, timedelta
             expires_at = datetime.now(timezone.utc) + timedelta(days=days)
             pm = await self.send_message(chat_id, "⏳ Applying plan to all users…")
 
             count = self.db.set_plan_all_users(plan_id, expires_at, granted_by=admin_id)
-
             plan    = get_plan(plan_id)
             exp_str = expires_at.strftime('%Y-%m-%d')
+
+            # ── Notify every user with a plan-specific message ──────────
+            all_uids = self.db.get_all_users()
+            if plan_id == 'pro':
+                user_msg = (
+                    f"🎉 <b>Plan Update!</b>\n\n"
+                    f"⭐ An admin has activated the <b>Pro</b> plan for you!\n"
+                    f"📅 Expires: <b>{exp_str}</b>\n\n"
+                    f"✅ Unlimited conversions, batch up to {plan.batch_limit} files.\n"
+                    f"Enjoy! 🚀"
+                )
+            else:
+                user_msg = (
+                    f"ℹ️ <b>Plan Update!</b>\n\n"
+                    f"🆓 Your plan has been set to <b>Free</b> by an admin.\n"
+                    f"📅 Valid until: <b>{exp_str}</b>\n\n"
+                    f"• Daily limit : 5 conversions\n"
+                    f"• Batch size  : up to {plan.batch_limit} files\n"
+                    f"Use /upgrade to get Pro."
+                )
+
+            notified = 0
+            for uid in all_uids:
+                if uid == admin_id:
+                    continue
+                try:
+                    await self.send_message(uid, user_msg)
+                    notified += 1
+                    await asyncio.sleep(0.05)
+                except Exception:
+                    pass
+
             summary = (
-                f"✅ {plan.emoji} <b>{plan.name}</b> plan granted to "
+                f"✅ {plan.emoji} <b>{plan.name}</b> plan applied to "
                 f"<b>{count}</b> users!\n"
-                f"Expires: <b>{exp_str}</b>"
+                f"📅 Expires: <b>{exp_str}</b>\n"
+                f"📨 Notified: <b>{notified}</b> users"
             )
             if pm:
                 await self.edit_message(chat_id, pm['message_id'], summary)
             else:
                 await self.send_message(chat_id, summary)
 
-            logger.info(f"Admin {admin_id} gave {plan_id}/{days}d to all {count} users")
+            logger.info(f"Admin {admin_id} gave {plan_id}/{days}d to all {count} users, notified {notified}")
         except ValueError:
             await self.send_message(chat_id, "❌ Invalid days value. Use a number (1–100).")
-
-    # ================================================================== #
-    # /genkey — generate activation keys
-    # ================================================================== #
-
-    async def _handle_genkey(self, chat_id: int, admin_id: int, parts: list):
-        """
-        /genkey [plan_id] [days] [count=1] [max_uses=1]
-        Examples:
-          /genkey pro 30
-          /genkey pro 30 5
-          /genkey pro 30 20000 1
-        """
-        if len(parts) < 3:
-            await self.send_message(
-                chat_id,
-                "❌ Usage: /genkey [plan] [days] [count] [max_uses]\n"
-                "Examples:\n"
-                "  /genkey pro 30        — 1 key, 30 days\n"
-                "  /genkey pro 30 5      — 5 keys\n"
-                "  /genkey pro 7 20000   — 20 000 keys\n"
-                "  /genkey pro 30 10 5   — 10 keys, each usable 5 times"
-            )
-            return
-        try:
-            import secrets as _secrets
-            import string as _string
-            plan_id  = parts[1].lower()
-            if plan_id not in ('free', 'pro'):
-                await self.send_message(chat_id, "❌ plan_id must be 'free' or 'pro'.")
-                return
-
-            days     = int(parts[2])
-            count    = int(parts[3]) if len(parts) >= 4 else 1
-            max_uses = int(parts[4]) if len(parts) >= 5 else 1
-
-            if not (1 <= days <= 365):
-                await self.send_message(chat_id, "❌ Days must be 1–365.")
-                return
-            if not (1 <= count <= 20000):
-                await self.send_message(chat_id, "❌ Count must be 1–20 000.")
-                return
-            if not (1 <= max_uses <= 1000):
-                await self.send_message(chat_id, "❌ Max uses must be 1–1000.")
-                return
-
-            pm = await self.send_message(chat_id, f"🔑 Generating {count} key(s)…")
-
-            alphabet = _string.ascii_uppercase + _string.digits
-            keys = []
-            while len(keys) < count:
-                raw = ''.join(_secrets.choice(alphabet) for _ in range(16))
-                k   = f"{raw[:4]}-{raw[4:8]}-{raw[8:12]}-{raw[12:16]}"
-                keys.append(k)
-
-            inserted = self.db.create_activation_keys(
-                keys, plan_id, days, admin_id, max_uses
-            )
-            plan = get_plan(plan_id)
-
-            if inserted == 0:
-                final = "❌ Failed to save keys to database. Please try again."
-                if pm:
-                    await self.edit_message(chat_id, pm['message_id'], final)
-                else:
-                    await self.send_message(chat_id, final)
-                return
-
-            if count <= 20:
-                # Show keys inline
-                key_lines = "\n".join(f"<code>{k}</code>" for k in keys[:inserted])
-                final = (
-                    f"✅ <b>{inserted} key(s) generated</b>\n"
-                    f"{plan.emoji} Plan: {plan.name} | Days: {days} | Max uses: {max_uses}\n\n"
-                    f"{key_lines}"
-                )
-                if pm:
-                    await self.edit_message(chat_id, pm['message_id'], final)
-                else:
-                    await self.send_message(chat_id, final)
-            else:
-                # Large batch — send as .txt file
-                key_text = "\n".join(keys[:inserted])
-                fd, fpath = tempfile.mkstemp(suffix='.txt')
-                try:
-                    with os.fdopen(fd, 'w') as tf:
-                        tf.write(key_text)
-                    fname = f"keys_{plan_id}_{days}d_{inserted}.txt"
-                    summary = (
-                        f"✅ <b>{inserted} keys generated</b>\n"
-                        f"{plan.emoji} Plan: {plan.name} | Days: {days} | Max uses: {max_uses}"
-                    )
-                    if pm:
-                        await self.edit_message(chat_id, pm['message_id'], summary)
-                    else:
-                        await self.send_message(chat_id, summary)
-                    await self._send_document(chat_id, fpath, fname)
-                finally:
-                    if os.path.exists(fpath):
-                        os.unlink(fpath)
-
-            logger.info(f"Admin {admin_id} generated {inserted} {plan_id}/{days}d keys")
-
-        except ValueError:
-            await self.send_message(chat_id, "❌ Invalid number. Check usage.")
         except Exception as e:
-            logger.error(f"genkey error: {e}")
-            await self.send_message(chat_id, f"❌ Error generating keys: {e}")
+            logger.error(f"giveplanall error: {e}")
+            await self.send_message(chat_id, f"❌ Error: {e}")
 
     # ================================================================== #
     # /redeem — user redeems an activation key
@@ -1222,27 +1144,24 @@ class EnhancedSVGToTGSBot:
 
     async def _handle_setprice(self, chat_id: int, admin_id: int, parts: list):
         """
-        /setprice [plan_id] [stars]
-        Example: /setprice pro 99
+        /setprice [stars]
+        Example: /setprice 100
+        Always updates Pro plan price — no plan_id needed.
         """
         try:
-            if len(parts) < 3:
-                pro_current = self.db.get_effective_price('pro', PRO_PLAN.price_stars)
+            pro_current = self.db.get_effective_price('pro', PRO_PLAN.price_stars)
+
+            if len(parts) < 2:
                 await self.send_message(
                     chat_id,
-                    f"ℹ️ Usage: /setprice [plan_id] [stars]\n"
-                    f"Example: /setprice pro 99\n\n"
-                    f"Current prices:\n"
-                    f"⭐ Pro: <b>{pro_current} Stars/month</b>"
+                    f"ℹ️ <b>Set Pro Plan Price</b>\n\n"
+                    f"Usage: /setprice [stars]\n"
+                    f"Example: /setprice 100\n\n"
+                    f"⭐ Current price: <b>{pro_current} Stars/month</b>"
                 )
                 return
 
-            plan_id = parts[1].lower()
-            if plan_id not in ('pro',):
-                await self.send_message(chat_id, "❌ Only 'pro' price can be changed.")
-                return
-
-            stars = int(parts[2])
+            stars = int(parts[1])
             if stars < 1:
                 await self.send_message(chat_id, "❌ Price must be at least 1 Star.")
                 return
@@ -1250,20 +1169,20 @@ class EnhancedSVGToTGSBot:
                 await self.send_message(chat_id, "❌ Price cannot exceed 10 000 Stars.")
                 return
 
-            ok = self.db.set_plan_price(plan_id, stars, set_by=admin_id)
+            ok = self.db.set_plan_price('pro', stars, set_by=admin_id)
             if ok:
-                plan = get_plan(plan_id)
                 await self.send_message(
                     chat_id,
-                    f"✅ {plan.emoji} <b>{plan.name}</b> plan price updated!\n"
-                    f"New price: <b>{stars} ⭐ Stars/month</b>\n\n"
-                    f"Next /upgrade invoice will use the new price."
+                    f"✅ ⭐ <b>Pro</b> plan price updated!\n"
+                    f"Old price : <b>{pro_current} Stars/month</b>\n"
+                    f"New price : <b>{stars} Stars/month</b>\n\n"
+                    f"Next /upgrade invoice will charge <b>{stars} ⭐</b>."
                 )
-                logger.info(f"Admin {admin_id} set {plan_id} price to {stars} Stars")
+                logger.info(f"Admin {admin_id} set pro price {pro_current} → {stars} Stars")
             else:
                 await self.send_message(chat_id, "❌ Failed to update price in database.")
         except ValueError:
-            await self.send_message(chat_id, "❌ Invalid price. Use a whole number e.g. /setprice pro 99")
+            await self.send_message(chat_id, "❌ Invalid number. Example: /setprice 100")
         except Exception as e:
             logger.error(f"setprice error: {e}")
             await self.send_message(chat_id, f"❌ Error: {e}")
