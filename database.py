@@ -6,7 +6,7 @@ Compatible with Python 3.11+ and MongoDB Atlas on Render.
 import os
 import logging
 import certifi
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 
 from pymongo import MongoClient, DESCENDING
 from pymongo.errors import DuplicateKeyError
@@ -62,7 +62,7 @@ class Database:
 
     def add_user(self, user_id, username=None, first_name=None, last_name=None):
         try:
-            now = datetime.utcnow()
+            now = datetime.now(timezone.utc)
             self.users.update_one(
                 {'user_id': user_id},
                 {
@@ -146,7 +146,7 @@ class Database:
                 return 'free'
             plan_id    = doc.get('plan_id', 'free')
             expires_at = doc.get('expires_at')
-            if plan_id != 'free' and expires_at and datetime.utcnow() > expires_at:
+            if plan_id != 'free' and expires_at and datetime.now(timezone.utc) > expires_at:
                 self.subscriptions.update_one(
                     {'user_id': user_id},
                     {'$set': {'plan_id': 'free', 'expires_at': None}}
@@ -181,7 +181,7 @@ class Database:
                 {'user_id': user_id},
                 {'$set': {
                     'plan_id':    plan_id,
-                    'started_at': datetime.utcnow(),
+                    'started_at': datetime.now(timezone.utc),
                     'expires_at': expires_at,
                     'granted_by': granted_by,
                 }},
@@ -198,7 +198,7 @@ class Database:
 
     def get_today_usage(self, user_id: int) -> int:
         try:
-            today = datetime.utcnow().strftime('%Y-%m-%d')
+            today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
             doc   = self.daily_usage.find_one({'user_id': user_id, 'usage_date': today})
             return doc.get('count', 0) if doc else 0
         except Exception as e:
@@ -207,7 +207,7 @@ class Database:
 
     def increment_today_usage(self, user_id: int, amount: int = 1):
         try:
-            today = datetime.utcnow().strftime('%Y-%m-%d')
+            today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
             self.daily_usage.update_one(
                 {'user_id': user_id, 'usage_date': today},
                 {'$inc': {'count': amount}},
@@ -237,7 +237,7 @@ class Database:
                 'stars_amount':       stars_amount,
                 'plan_id':            plan_id,
                 'status':             status,
-                'created_at':         datetime.utcnow(),
+                'created_at':         datetime.now(timezone.utc),
             })
             return str(result.inserted_id)
         except DuplicateKeyError:
@@ -268,7 +268,7 @@ class Database:
                 'file_size':       file_size,
                 'file_type':       file_type,
                 'success':         success,
-                'conversion_date': datetime.utcnow(),
+                'conversion_date': datetime.now(timezone.utc),
             })
         except Exception as e:
             logger.error(f"Error logging conversion {user_id}: {e}")
@@ -288,7 +288,7 @@ class Database:
 
     def get_stats(self) -> dict:
         try:
-            active_cutoff      = datetime.utcnow() - timedelta(days=7)
+            active_cutoff      = datetime.now(timezone.utc) - timedelta(days=7)
             total_users        = self.users.count_documents({})
             active_users       = self.users.count_documents({'last_active': {'$gte': active_cutoff}})
             banned_users       = self.users.count_documents({'is_banned': True})
@@ -343,7 +343,7 @@ class Database:
                 'media_type':    media_type,
                 'media_file_id': media_file_id,
                 'sent_count':    0,
-                'created_date':  datetime.utcnow(),
+                'created_date':  datetime.now(timezone.utc),
             })
             return str(result.inserted_id)
         except Exception as e:

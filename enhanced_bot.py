@@ -17,7 +17,9 @@ import requests
 import tempfile
 import asyncio
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import threading
 
 from database import Database
 from batch_converter import BatchConverter
@@ -304,7 +306,7 @@ class EnhancedSVGToTGSBot:
         charge_id = payment['telegram_payment_charge_id']
         stars     = payment['total_amount']
 
-        expires = datetime.utcnow() + timedelta(days=30)
+        expires = datetime.now(timezone.utc) + timedelta(days=30)
         self.db.set_user_plan(user_id, 'pro', expires_at=expires)
         self.db.log_payment(user_id, charge_id, stars, 'pro', status='completed')
 
@@ -346,7 +348,7 @@ class EnhancedSVGToTGSBot:
             days_given = None
             if len(parts) >= 4:
                 days_given = int(parts[3])
-                expires_at = datetime.utcnow() + timedelta(days=days_given)
+                expires_at = datetime.now(timezone.utc) + timedelta(days=days_given)
 
             self.db.set_user_plan(uid, plan_id, expires_at=expires_at, granted_by=admin_id)
 
@@ -490,7 +492,7 @@ class EnhancedSVGToTGSBot:
                 f"✅ Successful         : {s.get('success_conversions', 0)}\n"
                 f"📊 Success Rate       : {s.get('success_rate', 0)}%\n\n"
                 f"💰 Stars Earned       : {s.get('total_stars_earned', 0)} ⭐\n\n"
-                f"🕐 {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC"
+                f"🕐 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC"
             )
             await self.send_message(chat_id, text)
         except Exception as e:
@@ -986,8 +988,31 @@ class EnhancedSVGToTGSBot:
 
 
 # ======================================================================== #
+# Health-check HTTP server (keeps Render Web Service happy)
+# ======================================================================== #
+
+class _HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def log_message(self, *args):
+        pass   # silence access logs
+
+
+def _start_health_server():
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), _HealthHandler)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    logger.info(f"Health-check server listening on port {port}")
+
+
+# ======================================================================== #
 
 async def main():
+    _start_health_server()
     bot = EnhancedSVGToTGSBot()
     await bot.start()
 

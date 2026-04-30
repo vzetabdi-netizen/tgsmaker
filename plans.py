@@ -33,7 +33,7 @@ PRO_PLAN = Plan(
     name        = "Pro",
     plan_id     = "pro",
     daily_limit = -1,       # unlimited
-    batch_limit = 15,
+    batch_limit = 50,
     price_stars = 150,      # 150 Telegram Stars / month
     emoji       = "⭐",
 )
