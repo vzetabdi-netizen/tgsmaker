@@ -28,7 +28,6 @@ A production-ready Telegram bot that converts **SVG** files to **TGS** (Telegram
 | `/mystats` | Personal stats: total, successful, failed conversions |
 | `/myhistory` | Last 10 conversions with file name, size, and date |
 | `/upgrade` | Pay via Telegram Stars and activate Pro instantly |
-| `/redeem [KEY]` | Redeem an activation key given by an admin |
 | `/help` | Full help message with file requirements and plan info |
 
 ---
@@ -41,10 +40,10 @@ A production-ready Telegram bot that converts **SVG** files to **TGS** (Telegram
 | `/broadcast [msg]` | Send text, photo, video, or document to all users |
 | `/ban [user_id]` | Ban a user |
 | `/unban [user_id]` | Unban a user |
-| `/giveplan [id] [plan] [days]` | Grant a plan to a specific user (days optional = permanent) |
-| `/removeplan [user_id]` | Downgrade a specific user to Free |
-| `/giveplanall [plan] [days]` | Grant a plan to all non-paid users (paid Stars users are protected) |
-| `/removeplanall` | Downgrade all non-paid users to Free (requires `/removeplanall confirm`) |
+| `/premium [id] [plan] [days]` | Grant a plan to a specific user (days optional = permanent) |
+| `/rpremium [user_id]` | Downgrade a specific user to Free |
+| `/premiumall [plan] [days]` | Grant a plan to all Free users (paid and `/premium` users are protected) |
+| `/rpremiumall` | Revert only the plans granted via `/premiumall` (requires `/rpremiumall confirm`) |
 | `/topusers` | Top 10 users by total successful conversions |
 | `/setprice [stars]` | Change the Pro plan price (e.g. `/setprice 100`) |
 | `/adminhelp` | Admin command reference |
@@ -56,7 +55,7 @@ A production-ready Telegram bot that converts **SVG** files to **TGS** (Telegram
 | `/makeadmin [user_id]` | Grant admin privileges |
 | `/removeadmin [user_id]` | Revoke admin privileges |
 
-> **Paid user protection:** `/giveplanall` and `/removeplanall` never touch users who have paid via Telegram Stars. Their plans are always preserved.
+> **Paid user protection:** `/premiumall` and `/rpremiumall` never touch users who have paid via Telegram Stars or who were given Pro individually via `/premium`. Their plans are always preserved.
 
 ---
 
@@ -67,12 +66,12 @@ A production-ready Telegram bot that converts **SVG** files to **TGS** (Telegram
 /broadcast Hello everyone! New feature released.
 /ban 123456789
 /unban 123456789
-/giveplan 123456789 pro 30        — Pro for 30 days
-/giveplan 123456789 pro           — Pro permanently
-/removeplan 123456789
-/giveplanall pro 7                — Pro for 7 days to all non-paid users
-/removeplanall                    — Shows confirmation prompt
-/removeplanall confirm            — Executes downgrade
+/premium 123456789 pro 30         — Pro for 30 days
+/premium 123456789 pro            — Pro permanently
+/rpremium 123456789
+/premiumall pro 7                 — Pro for 7 days to all Free users
+/rpremiumall                      — Shows confirmation prompt
+/rpremiumall confirm              — Reverts only /premiumall grants
 /setprice 100                     — Set Pro to 100 Stars/month
 /makeadmin 123456789              — Owner only
 /removeadmin 123456789            — Owner only
@@ -89,7 +88,7 @@ A production-ready Telegram bot that converts **SVG** files to **TGS** (Telegram
 5. Bot activates Pro plan for 30 days and notifies the user
 6. Plan auto-expires; user returns to Free automatically
 
-Paid users are **permanently protected** — `/giveplanall` and `/removeplanall` will never override their subscription.
+Paid users are **permanently protected** — `/premiumall` and `/rpremiumall` will never override their subscription.
 
 To test payments: `@BotFather → Payments → Test Mode`
 
@@ -112,7 +111,7 @@ enhanced_bot.py    — Main bot: polling loop, command router, plan logic, payme
 converter.py       — SVG → TGS conversion engine (in-process lottie, subprocess fallback)
 batch_converter.py — Concurrent batch conversion + ZIP extraction
 svg_validator.py   — SVG validation (512×512, ≤1MB, ≤1000 elements)
-database.py        — MongoDB: users, subscriptions, payments, usage, history, keys, pricing
+database.py        — MongoDB: users, subscriptions, payments, usage, history, pricing
 plans.py           — Plan definitions (Free/Pro), pricing helpers
 config.py          — Environment variable loader (BOT_TOKEN, DATABASE_URL, OWNER_ID)
 ```
