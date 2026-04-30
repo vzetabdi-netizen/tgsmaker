@@ -1009,43 +1009,6 @@ class EnhancedSVGToTGSBot:
         await self.send_message(chat_id, text)
 
 
-# ======================================================================== #
-# Health-check HTTP server (keeps Render Web Service happy)
-# ======================================================================== #
-
-class _HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"OK")
-
-    def log_message(self, *args):
-        pass   # silence access logs
-
-
-def _start_health_server():
-    port = int(os.environ.get("PORT", 8080))
-    server = HTTPServer(("0.0.0.0", port), _HealthHandler)
-    t = threading.Thread(target=server.serve_forever, daemon=True)
-    t.start()
-    logger.info(f"Health-check server listening on port {port}")
-
-
-# ======================================================================== #
-
-async def main():
-    _start_health_server()
-    bot = EnhancedSVGToTGSBot()
-    await bot.start()
-
-
-if __name__ == '__main__':
-    asyncio.run(main())
-
-    # ================================================================== #
-    # /topusers
-    # ================================================================== #
-
     async def _handle_topusers(self, chat_id: int):
         top = self.db.get_top_users(limit=10)
         if not top:
@@ -1304,3 +1267,37 @@ if __name__ == '__main__':
         except Exception as e:
             logger.error(f"setprice error: {e}")
             await self.send_message(chat_id, f"❌ Error: {e}")
+
+
+# Health-check HTTP server (keeps Render Web Service happy)
+# ======================================================================== #
+
+class _HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def log_message(self, *args):
+        pass   # silence access logs
+
+
+def _start_health_server():
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), _HealthHandler)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    logger.info(f"Health-check server listening on port {port}")
+
+
+# ======================================================================== #
+
+async def main():
+    _start_health_server()
+    bot = EnhancedSVGToTGSBot()
+    await bot.start()
+
+
+if __name__ == '__main__':
+    asyncio.run(main())
+
