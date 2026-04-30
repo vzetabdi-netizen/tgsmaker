@@ -60,7 +60,8 @@ class EnhancedSVGToTGSBot:
         if oid:
             self.db.add_user(oid, "Bot Owner", "Bot", "Owner")
             self.db.set_admin(oid, True)
-            self.db.set_user_plan(oid, 'pro', expires_at=None, granted_by=oid)
+            self.db.set_user_plan(oid, 'pro', expires_at=None,
+                                  granted_by=oid, grant_source='giveplan')
             logger.info(f"Owner {oid} initialised as admin with Pro plan")
 
     # ================================================================== #
@@ -319,7 +320,8 @@ class EnhancedSVGToTGSBot:
         stars     = payment['total_amount']
 
         expires = datetime.now(timezone.utc) + timedelta(days=30)
-        self.db.set_user_plan(user_id, 'pro', expires_at=expires)
+        self.db.set_user_plan(user_id, 'pro', expires_at=expires,
+                              grant_source='payment')
         self.db.log_payment(user_id, charge_id, stars, 'pro', status='completed')
 
         exp_str = expires.strftime('%Y-%m-%d')
@@ -362,7 +364,8 @@ class EnhancedSVGToTGSBot:
                 days_given = int(parts[3])
                 expires_at = datetime.now(timezone.utc) + timedelta(days=days_given)
 
-            self.db.set_user_plan(uid, plan_id, expires_at=expires_at, granted_by=admin_id)
+            self.db.set_user_plan(uid, plan_id, expires_at=expires_at,
+                                  granted_by=admin_id, grant_source='giveplan')
 
             plan    = get_plan(plan_id)
             exp_str = "Never (permanent)" if expires_at is None \
@@ -422,7 +425,8 @@ class EnhancedSVGToTGSBot:
             return
         try:
             uid = int(parts[1])
-            self.db.set_user_plan(uid, 'free', expires_at=None, granted_by=admin_id)
+            self.db.set_user_plan(uid, 'free', expires_at=None,
+                                  granted_by=admin_id, grant_source='admin_remove')
 
             # Notify admin
             await self.send_message(
@@ -1046,7 +1050,11 @@ class EnhancedSVGToTGSBot:
         """
         /giveplanall [plan_id] [days]
         Example: /giveplanall pro 7
-        Skips users who have already paid via Telegram Stars.
+
+        Only affects users currently on the Free plan. Users with an active
+        Pro plan from any source (Stars payment, /giveplan, activation key,
+        or a previous /giveplanall) are LEFT UNTOUCHED — their plan and
+        expiration date are not modified.
         """
         if len(parts) < 3:
             await self.send_message(
@@ -1054,7 +1062,8 @@ class EnhancedSVGToTGSBot:
                 "❌ Usage: /giveplanall [plan_id] [days]\n"
                 "Example: /giveplanall pro 7\n"
                 "Days range: 1–365\n\n"
-                "⚠️ Users who paid via Stars are NOT affected."
+                "⚠️ Users with an active Pro plan (paid, /giveplan, or key) "
+                "are NOT affected."
             )
             return
         try:
@@ -1071,8 +1080,8 @@ class EnhancedSVGToTGSBot:
             expires_at = datetime.now(timezone.utc) + timedelta(days=days)
             pm = await self.send_message(chat_id, "⏳ Applying plan to users…")
 
-            updated, skipped = self.db.set_plan_all_users(
-                plan_id, expires_at, granted_by=admin_id, skip_paid=True
+            updated, skipped, updated_uids = self.db.set_plan_all_users(
+                plan_id, expires_at, granted_by=admin_id
             )
             plan    = get_plan(plan_id)
             exp_str = expires_at.strftime('%Y-%m-%d')
@@ -1097,8 +1106,7 @@ class EnhancedSVGToTGSBot:
                     f"Use /upgrade to get Pro."
                 )
 
-            # Only notify users who were actually updated (not skipped)
-            updated_uids = self.db.get_users_without_paid_plan()
+            # Only notify users whose plan was actually changed.
             notified = 0
             for uid in updated_uids:
                 if uid == admin_id:
@@ -1112,8 +1120,9 @@ class EnhancedSVGToTGSBot:
 
             summary = (
                 f"✅ {plan.emoji} <b>{plan.name}</b> plan applied!\n\n"
-                f"👥 Updated  : <b>{updated}</b> users\n"
-                f"💳 Skipped  : <b>{skipped}</b> (paid users protected)\n"
+                f"👥 Updated  : <b>{updated}</b> users (were on Free)\n"
+                f"🛡 Skipped  : <b>{skipped}</b> users (active Pro — paid, "
+                f"/giveplan, or key — left untouched)\n"
                 f"📨 Notified : <b>{notified}</b> users\n"
                 f"📅 Expires  : <b>{exp_str}</b>"
             )
@@ -1124,7 +1133,7 @@ class EnhancedSVGToTGSBot:
 
             logger.info(
                 f"Admin {admin_id} gave {plan_id}/{days}d to {updated} users "
-                f"(skipped {skipped} paid), notified {notified}"
+                f"(skipped {skipped} active-Pro), notified {notified}"
             )
         except ValueError:
             await self.send_message(chat_id, "❌ Invalid days value. Use a number (1–365).")
@@ -1139,41 +1148,58 @@ class EnhancedSVGToTGSBot:
     async def _handle_removeplanall(self, chat_id: int, admin_id: int, parts: list):
         """
         /removeplanall
-        Downgrades ALL non-banned users (except paid Stars users) to Free.
+        Reverts ONLY the plans that were granted via /giveplanall.
+
+        Plans from any other source are LEFT UNTOUCHED:
+          - Stars payments
+          - Individual /giveplan grants
+          - Activation keys
+
         Usage: /removeplanall        — with confirmation prompt
                /removeplanall confirm — executes immediately
         """
+        # Count how many subscriptions were granted via /giveplanall.
+        try:
+            target_count = self.db.subscriptions.count_documents(
+                {'grant_source': 'giveplanall'}
+            )
+        except Exception:
+            target_count = 0
+
         confirmed = len(parts) > 1 and parts[1].lower() == 'confirm'
         if not confirmed:
             total = len(self.db.get_all_users())
             paid  = len(self.db.get_paid_user_ids())
             await self.send_message(
                 chat_id,
-                f"⚠️ <b>Remove plan from ALL users?</b>\n\n"
-                f"👥 Total users   : <b>{total}</b>\n"
-                f"💳 Paid (skip)   : <b>{paid}</b> users will be protected\n"
-                f"🆓 Will downgrade: <b>{total - paid}</b> users to Free\n\n"
+                f"⚠️ <b>Remove /giveplanall grants from ALL users?</b>\n\n"
+                f"👥 Total users        : <b>{total}</b>\n"
+                f"💳 Paid (protected)   : <b>{paid}</b>\n"
+                f"🎁 Will downgrade     : <b>{target_count}</b> users "
+                f"granted via /giveplanall\n\n"
+                f"🛡 Plans from /giveplan and activation keys are also "
+                f"protected and will NOT be touched.\n\n"
                 f"To confirm, send:\n<code>/removeplanall confirm</code>"
             )
             return
 
-        pm = await self.send_message(chat_id, "⏳ Removing plans…")
+        pm = await self.send_message(chat_id, "⏳ Removing /giveplanall grants…")
         try:
-            updated, skipped = self.db.remove_plan_all_users(
-                granted_by=admin_id, skip_paid=True
+            updated, skipped, updated_uids = self.db.remove_plan_all_users(
+                granted_by=admin_id
             )
 
             user_msg = (
                 "ℹ️ <b>Plan Update!</b>\n\n"
-                "🆓 Your plan has been changed to <b>Free</b> by an admin.\n\n"
+                "🆓 Your bonus Pro plan from an admin has ended. "
+                "Your plan has been changed to <b>Free</b>.\n\n"
                 "📊 Daily limit: 5 conversions\n"
                 "📦 Batch up to 5 files\n\n"
                 "Use /upgrade to get Pro again."
             )
 
-            downgraded_uids = self.db.get_users_without_paid_plan()
             notified = 0
-            for uid in downgraded_uids:
+            for uid in updated_uids:
                 if uid == admin_id:
                     continue
                 try:
@@ -1185,8 +1211,10 @@ class EnhancedSVGToTGSBot:
 
             summary = (
                 f"✅ <b>Remove Plan All — Done!</b>\n\n"
-                f"🆓 Downgraded : <b>{updated}</b> users → Free\n"
-                f"💳 Skipped    : <b>{skipped}</b> paid users (protected)\n"
+                f"🆓 Downgraded : <b>{updated}</b> users (only "
+                f"/giveplanall grants)\n"
+                f"🛡 Protected  : <b>{skipped}</b> users (paid, /giveplan, "
+                f"keys, and free users untouched)\n"
                 f"📨 Notified   : <b>{notified}</b> users"
             )
             if pm:
@@ -1195,8 +1223,8 @@ class EnhancedSVGToTGSBot:
                 await self.send_message(chat_id, summary)
 
             logger.info(
-                f"Admin {admin_id} removed plan from {updated} users "
-                f"(skipped {skipped} paid), notified {notified}"
+                f"Admin {admin_id} removed /giveplanall grants from "
+                f"{updated} users (protected {skipped}), notified {notified}"
             )
         except Exception as e:
             logger.error(f"removeplanall error: {e}")

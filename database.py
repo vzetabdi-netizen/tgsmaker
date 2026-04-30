@@ -22,9 +22,12 @@ class Database:
             raise ValueError("DATABASE_URL environment variable not found")
 
         # tlsCAFile=certifi.where() fixes SSL handshake errors on Render / Python 3.11+
+        # tz_aware=True makes MongoDB return timezone-aware datetimes (UTC) so that
+        # comparisons against datetime.now(timezone.utc) don't raise TypeError.
         self.client = MongoClient(
             uri,
             tlsCAFile=certifi.where(),
+            tz_aware=True,
             serverSelectionTimeoutMS=30000,
             connectTimeoutMS=20000,
             socketTimeoutMS=20000,
@@ -150,6 +153,12 @@ class Database:
                 return 'free'
             plan_id    = doc.get('plan_id', 'free')
             expires_at = doc.get('expires_at')
+
+            # Defensive: ensure expires_at is timezone-aware before comparing.
+            # Older docs written before tz_aware=True may have naive UTC datetimes.
+            if expires_at is not None and expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=timezone.utc)
+
             if plan_id != 'free' and expires_at and datetime.now(timezone.utc) > expires_at:
                 self.subscriptions.update_one(
                     {'user_id': user_id},
@@ -166,12 +175,16 @@ class Database:
         try:
             doc = self.subscriptions.find_one({'user_id': user_id})
             if not doc:
-                return {'plan_id': 'free', 'started_at': None, 'expires_at': None, 'granted_by': None}
+                return {
+                    'plan_id': 'free', 'started_at': None, 'expires_at': None,
+                    'granted_by': None, 'grant_source': None,
+                }
             return {
-                'plan_id':    doc.get('plan_id', 'free'),
-                'started_at': doc.get('started_at'),
-                'expires_at': doc.get('expires_at'),
-                'granted_by': doc.get('granted_by'),
+                'plan_id':      doc.get('plan_id', 'free'),
+                'started_at':   doc.get('started_at'),
+                'expires_at':   doc.get('expires_at'),
+                'granted_by':   doc.get('granted_by'),
+                'grant_source': doc.get('grant_source'),
             }
         except Exception as e:
             logger.error(f"Error getting subscription {user_id}: {e}")
@@ -179,15 +192,30 @@ class Database:
 
     def set_user_plan(self, user_id: int, plan_id: str,
                       expires_at: datetime | None = None,
-                      granted_by: int | None = None) -> bool:
+                      granted_by: int | None = None,
+                      grant_source: str | None = None) -> bool:
+        """
+        Set a user's plan.
+
+        grant_source is a marker indicating HOW the plan was granted, used by the
+        bulk admin commands (/giveplanall, /removeplanall) to avoid clobbering
+        plans that came from other sources. Known values:
+            'payment'      — purchased via Telegram Stars
+            'giveplan'     — granted individually by an admin
+            'giveplanall'  — granted via the bulk admin command
+            'key'          — redeemed an activation key
+            'admin_remove' — explicitly downgraded by an admin
+            None           — unspecified / legacy
+        """
         try:
             self.subscriptions.update_one(
                 {'user_id': user_id},
                 {'$set': {
-                    'plan_id':    plan_id,
-                    'started_at': datetime.now(timezone.utc),
-                    'expires_at': expires_at,
-                    'granted_by': granted_by,
+                    'plan_id':      plan_id,
+                    'started_at':   datetime.now(timezone.utc),
+                    'expires_at':   expires_at,
+                    'granted_by':   granted_by,
+                    'grant_source': grant_source,
                 }},
                 upsert=True
             )
@@ -422,74 +450,129 @@ class Database:
             logger.error(f"Error getting non-paid users: {e}")
             return []
 
-    def set_plan_all_users(self, plan_id: str,
-                           expires_at, granted_by: int,
-                           skip_paid: bool = True) -> tuple[int, int]:
+    def _user_has_active_pro(self, uid: int, paid_ids: set) -> bool:
         """
-        Set plan for every non-banned user.
-        If skip_paid=True, users who have ever paid via Stars are not downgraded/changed.
-        Returns (count_updated, count_skipped).
+        True if the user currently has an active Pro plan from ANY source —
+        a Stars payment, an individual /giveplan grant, an activation key,
+        or a previous /giveplanall that hasn't expired yet.
+        """
+        if uid in paid_ids:
+            return True
+        sub = self.subscriptions.find_one(
+            {'user_id': uid},
+            {'plan_id': 1, 'expires_at': 1, '_id': 0}
+        )
+        if not sub:
+            return False
+        if sub.get('plan_id') != 'pro':
+            return False
+        exp = sub.get('expires_at')
+        if exp is None:
+            return True  # permanent Pro
+        if exp.tzinfo is None:
+            exp = exp.replace(tzinfo=timezone.utc)
+        return datetime.now(timezone.utc) < exp
+
+    def set_plan_all_users(self, plan_id: str,
+                           expires_at, granted_by: int) -> tuple[int, int, list[int]]:
+        """
+        Bulk-grant a plan to every non-banned user who is currently on Free.
+
+        Users are SKIPPED (left untouched) if they already have an active Pro
+        plan from ANY source — Stars payments, /giveplan grants, redeemed keys,
+        or previous /giveplanall grants that haven't expired. This ensures the
+        bulk command never downgrades or reschedules an existing Pro plan.
+
+        The new plan is tagged with grant_source='giveplanall' so that
+        /removeplanall can later remove ONLY plans granted this way.
+
+        Returns (count_updated, count_skipped, updated_user_ids).
         """
         try:
             user_ids = [d['user_id'] for d in
                         self.users.find({'is_banned': False}, {'user_id': 1, '_id': 0})]
-            paid_ids = self.get_paid_user_ids() if skip_paid else set()
+            paid_ids = self.get_paid_user_ids()
             now = datetime.now(timezone.utc)
-            updated = 0
+            updated_ids: list[int] = []
             skipped = 0
             for uid in user_ids:
-                if skip_paid and uid in paid_ids:
+                if self._user_has_active_pro(uid, paid_ids):
                     skipped += 1
                     continue
                 self.subscriptions.update_one(
                     {'user_id': uid},
                     {'$set': {
-                        'plan_id':    plan_id,
-                        'started_at': now,
-                        'expires_at': expires_at,
-                        'granted_by': granted_by,
+                        'plan_id':      plan_id,
+                        'started_at':   now,
+                        'expires_at':   expires_at,
+                        'granted_by':   granted_by,
+                        'grant_source': 'giveplanall',
                     }},
                     upsert=True
                 )
-                updated += 1
-            return updated, skipped
+                updated_ids.append(uid)
+            return len(updated_ids), skipped, updated_ids
         except Exception as e:
             logger.error(f"Error in set_plan_all_users: {e}")
-            return 0, 0
+            return 0, 0, []
 
-    def remove_plan_all_users(self, granted_by: int,
-                              skip_paid: bool = True) -> tuple[int, int]:
+    def remove_plan_all_users(self, granted_by: int) -> tuple[int, int, list[int]]:
         """
-        Downgrade every non-banned user to Free plan.
-        If skip_paid=True, users who have paid via Stars are not touched.
-        Returns (count_updated, count_skipped).
+        Bulk-revert ONLY the plans that were granted via /giveplanall.
+
+        Plans coming from any other source are left untouched:
+          - Stars payments
+          - Individual /giveplan grants
+          - Redeemed activation keys
+          - Anything with grant_source != 'giveplanall'
+
+        Returns (count_updated, count_skipped, updated_user_ids).
+        skipped = total non-banned users that were NOT downgraded.
         """
         try:
-            user_ids = [d['user_id'] for d in
-                        self.users.find({'is_banned': False}, {'user_id': 1, '_id': 0})]
-            paid_ids = self.get_paid_user_ids() if skip_paid else set()
+            total_users = self.users.count_documents({'is_banned': False})
+
+            # Only target subscriptions explicitly tagged as bulk grants from
+            # /giveplanall. As an extra safety net, also confirm the user is
+            # not in the paid-users set before downgrading.
+            paid_ids = self.get_paid_user_ids()
+            target_docs = list(self.subscriptions.find(
+                {'grant_source': 'giveplanall'},
+                {'user_id': 1, '_id': 0}
+            ))
+
             now = datetime.now(timezone.utc)
-            updated = 0
-            skipped = 0
-            for uid in user_ids:
-                if skip_paid and uid in paid_ids:
-                    skipped += 1
+            updated_ids: list[int] = []
+            for doc in target_docs:
+                uid = doc['user_id']
+                if uid in paid_ids:
+                    # Defense in depth: never downgrade a paying customer,
+                    # even if their record was somehow tagged as 'giveplanall'.
+                    continue
+                # Make sure this user still exists and is not banned.
+                u = self.users.find_one(
+                    {'user_id': uid, 'is_banned': False},
+                    {'_id': 1}
+                )
+                if not u:
                     continue
                 self.subscriptions.update_one(
                     {'user_id': uid},
                     {'$set': {
-                        'plan_id':    'free',
-                        'started_at': now,
-                        'expires_at': None,
-                        'granted_by': granted_by,
-                    }},
-                    upsert=True
+                        'plan_id':      'free',
+                        'started_at':   now,
+                        'expires_at':   None,
+                        'granted_by':   granted_by,
+                        'grant_source': 'admin_remove',
+                    }}
                 )
-                updated += 1
-            return updated, skipped
+                updated_ids.append(uid)
+
+            skipped = total_users - len(updated_ids)
+            return len(updated_ids), skipped, updated_ids
         except Exception as e:
             logger.error(f"Error in remove_plan_all_users: {e}")
-            return 0, 0
+            return 0, 0, []
 
     # ------------------------------------------------------------------ #
     # Activation Keys
@@ -546,7 +629,8 @@ class Database:
 
             expires_at = datetime.now(timezone.utc) + timedelta(days=doc['days'])
             self.set_user_plan(user_id, doc['plan_id'],
-                               expires_at=expires_at, granted_by=None)
+                               expires_at=expires_at, granted_by=None,
+                               grant_source='key')
 
             self.activation_keys.update_one(
                 {'key': key},
