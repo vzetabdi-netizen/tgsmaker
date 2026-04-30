@@ -15,11 +15,6 @@ from bson import ObjectId
 logger = logging.getLogger(__name__)
 
 
-def _now() -> datetime:
-    """Always return timezone-aware UTC datetime — safe to compare with MongoDB dates."""
-    return datetime.now(timezone.utc)
-
-
 class Database:
     def __init__(self):
         uri = os.environ.get('DATABASE_URL')
@@ -38,12 +33,14 @@ class Database:
         db_name  = os.environ.get('MONGO_DB_NAME', 'svg_tgs_bot')
         self.db  = self.client[db_name]
 
-        self.users         = self.db['users']
-        self.subscriptions = self.db['subscriptions']
-        self.payments      = self.db['payments']
-        self.daily_usage   = self.db['daily_usage']
-        self.conversions   = self.db['conversions']
-        self.broadcasts    = self.db['broadcasts']
+        self.users            = self.db['users']
+        self.subscriptions    = self.db['subscriptions']
+        self.payments         = self.db['payments']
+        self.daily_usage      = self.db['daily_usage']
+        self.conversions      = self.db['conversions']
+        self.broadcasts       = self.db['broadcasts']
+        self.activation_keys  = self.db['activation_keys']
+        self.plan_prices      = self.db['plan_prices']
 
         self._ensure_indexes()
         logger.info(f"MongoDB connected — db: {db_name}")
@@ -58,6 +55,8 @@ class Database:
             )
             self.conversions.create_index('user_id')
             self.conversions.create_index('conversion_date')
+            self.activation_keys.create_index('key', unique=True)
+            self.plan_prices.create_index('plan_id', unique=True)
         except Exception as e:
             logger.error(f"Index error: {e}")
 
@@ -67,7 +66,7 @@ class Database:
 
     def add_user(self, user_id, username=None, first_name=None, last_name=None):
         try:
-            now = _now()
+            now = datetime.now(timezone.utc)
             self.users.update_one(
                 {'user_id': user_id},
                 {
@@ -86,7 +85,6 @@ class Database:
                 },
                 upsert=True
             )
-            # Always guarantee a subscription row (default = free)
             self.subscriptions.update_one(
                 {'user_id': user_id},
                 {'$setOnInsert': {
@@ -135,9 +133,7 @@ class Database:
 
     def set_admin(self, user_id: int, is_admin: bool = True) -> bool:
         try:
-            res = self.users.update_one(
-                {'user_id': user_id}, {'$set': {'is_admin': is_admin}}
-            )
+            res = self.users.update_one({'user_id': user_id}, {'$set': {'is_admin': is_admin}})
             return res.matched_count > 0
         except Exception as e:
             logger.error(f"Error setting admin {user_id}: {e}")
@@ -148,30 +144,19 @@ class Database:
     # ------------------------------------------------------------------ #
 
     def get_user_plan(self, user_id: int) -> str:
-        """
-        Return active plan_id ('free' or 'pro').
-        Compares with timezone-aware UTC now to avoid TZ mismatch bugs.
-        """
         try:
             doc = self.subscriptions.find_one({'user_id': user_id})
             if not doc:
                 return 'free'
-
             plan_id    = doc.get('plan_id', 'free')
             expires_at = doc.get('expires_at')
-
-            if plan_id != 'free' and expires_at is not None:
-                # Make expires_at timezone-aware if MongoDB returned naive datetime
-                if expires_at.tzinfo is None:
-                    expires_at = expires_at.replace(tzinfo=timezone.utc)
-                if _now() > expires_at:
-                    self.subscriptions.update_one(
-                        {'user_id': user_id},
-                        {'$set': {'plan_id': 'free', 'expires_at': None}}
-                    )
-                    logger.info(f"User {user_id} Pro expired → Free")
-                    return 'free'
-
+            if plan_id != 'free' and expires_at and datetime.now(timezone.utc) > expires_at:
+                self.subscriptions.update_one(
+                    {'user_id': user_id},
+                    {'$set': {'plan_id': 'free', 'expires_at': None}}
+                )
+                logger.info(f"User {user_id} Pro expired → Free")
+                return 'free'
             return plan_id
         except Exception as e:
             logger.error(f"Error getting plan {user_id}: {e}")
@@ -181,16 +166,11 @@ class Database:
         try:
             doc = self.subscriptions.find_one({'user_id': user_id})
             if not doc:
-                return {'plan_id': 'free', 'started_at': None,
-                        'expires_at': None, 'granted_by': None}
-            expires_at = doc.get('expires_at')
-            # Normalise to timezone-aware
-            if expires_at is not None and expires_at.tzinfo is None:
-                expires_at = expires_at.replace(tzinfo=timezone.utc)
+                return {'plan_id': 'free', 'started_at': None, 'expires_at': None, 'granted_by': None}
             return {
                 'plan_id':    doc.get('plan_id', 'free'),
                 'started_at': doc.get('started_at'),
-                'expires_at': expires_at,
+                'expires_at': doc.get('expires_at'),
                 'granted_by': doc.get('granted_by'),
             }
         except Exception as e:
@@ -200,56 +180,21 @@ class Database:
     def set_user_plan(self, user_id: int, plan_id: str,
                       expires_at: datetime | None = None,
                       granted_by: int | None = None) -> bool:
-        """
-        Set plan for a user.
-        IMPORTANT: also creates the subscription row if it doesn't exist (upsert).
-        expires_at should be timezone-aware; None = never expires.
-        """
         try:
-            now = _now()
             self.subscriptions.update_one(
                 {'user_id': user_id},
                 {'$set': {
                     'plan_id':    plan_id,
-                    'started_at': now,
+                    'started_at': datetime.now(timezone.utc),
                     'expires_at': expires_at,
                     'granted_by': granted_by,
                 }},
                 upsert=True
             )
-            logger.info(f"Plan '{plan_id}' set for user {user_id} (expires: {expires_at})")
             return True
         except Exception as e:
             logger.error(f"Error setting plan {user_id}: {e}")
             return False
-
-    def set_plan_all_users(self, plan_id: str,
-                           expires_at: datetime | None,
-                           granted_by: int) -> int:
-        """
-        Set plan for ALL non-banned users.
-        Returns count of users updated.
-        """
-        try:
-            now      = _now()
-            user_ids = [d['user_id'] for d in
-                        self.users.find({'is_banned': False}, {'user_id': 1, '_id': 0})]
-            for uid in user_ids:
-                self.subscriptions.update_one(
-                    {'user_id': uid},
-                    {'$set': {
-                        'plan_id':    plan_id,
-                        'started_at': now,
-                        'expires_at': expires_at,
-                        'granted_by': granted_by,
-                    }},
-                    upsert=True
-                )
-            logger.info(f"set_plan_all_users: {plan_id} → {len(user_ids)} users")
-            return len(user_ids)
-        except Exception as e:
-            logger.error(f"Error in set_plan_all_users: {e}")
-            return 0
 
     # ------------------------------------------------------------------ #
     # Daily usage
@@ -296,7 +241,7 @@ class Database:
                 'stars_amount':       stars_amount,
                 'plan_id':            plan_id,
                 'status':             status,
-                'created_at':         _now(),
+                'created_at':         datetime.now(timezone.utc),
             })
             return str(result.inserted_id)
         except DuplicateKeyError:
@@ -327,7 +272,7 @@ class Database:
                 'file_size':       file_size,
                 'file_type':       file_type,
                 'success':         success,
-                'conversion_date': _now(),
+                'conversion_date': datetime.now(timezone.utc),
             })
         except Exception as e:
             logger.error(f"Error logging conversion {user_id}: {e}")
@@ -347,12 +292,13 @@ class Database:
 
     def get_stats(self) -> dict:
         try:
-            active_cutoff       = _now() - timedelta(days=7)
-            total_users         = self.users.count_documents({})
-            active_users        = self.users.count_documents({'last_active': {'$gte': active_cutoff}})
-            banned_users        = self.users.count_documents({'is_banned': True})
-            pro_users           = self.subscriptions.count_documents({'plan_id': 'pro'})
-            total_conversions   = self.conversions.count_documents({})
+            active_cutoff      = datetime.now(timezone.utc) - timedelta(days=7)
+            total_users        = self.users.count_documents({})
+            active_users       = self.users.count_documents({'last_active': {'$gte': active_cutoff}})
+            banned_users       = self.users.count_documents({'is_banned': True})
+            admin_users        = self.users.count_documents({'is_admin': True})
+            pro_users          = self.subscriptions.count_documents({'plan_id': 'pro'})
+            total_conversions  = self.conversions.count_documents({})
             success_conversions = self.conversions.count_documents({'success': True})
 
             stars_agg   = list(self.payments.aggregate([
@@ -365,6 +311,7 @@ class Database:
                 'total_users':          total_users,
                 'active_users':         active_users,
                 'banned_users':         banned_users,
+                'admin_users':          admin_users,
                 'pro_users':            pro_users,
                 'total_conversions':    total_conversions,
                 'success_conversions':  success_conversions,
@@ -400,7 +347,7 @@ class Database:
                 'media_type':    media_type,
                 'media_file_id': media_file_id,
                 'sent_count':    0,
-                'created_date':  _now(),
+                'created_date':  datetime.now(timezone.utc),
             })
             return str(result.inserted_id)
         except Exception as e:
@@ -415,3 +362,174 @@ class Database:
             )
         except Exception as e:
             logger.error(f"Error updating broadcast count: {e}")
+
+    # ------------------------------------------------------------------ #
+    # Top Users
+    # ------------------------------------------------------------------ #
+
+    def get_top_users(self, limit: int = 10) -> list[dict]:
+        """Return top users ranked by total successful conversions."""
+        try:
+            pipeline = [
+                {'$match': {'success': True}},
+                {'$group': {'_id': '$user_id', 'total': {'$sum': 1}}},
+                {'$sort': {'total': -1}},
+                {'$limit': limit},
+            ]
+            rows = list(self.conversions.aggregate(pipeline))
+            result = []
+            for row in rows:
+                uid  = row['_id']
+                user = self.users.find_one({'user_id': uid},
+                                           {'username': 1, 'first_name': 1, '_id': 0})
+                sub  = self.subscriptions.find_one({'user_id': uid}, {'plan_id': 1, '_id': 0})
+                result.append({
+                    'user_id':    uid,
+                    'username':   (user or {}).get('username'),
+                    'first_name': (user or {}).get('first_name', 'User'),
+                    'plan_id':    (sub or {}).get('plan_id', 'free'),
+                    'total':      row['total'],
+                })
+            return result
+        except Exception as e:
+            logger.error(f"Error getting top users: {e}")
+            return []
+
+    # ------------------------------------------------------------------ #
+    # Give plan to ALL users
+    # ------------------------------------------------------------------ #
+
+    def set_plan_all_users(self, plan_id: str,
+                           expires_at, granted_by: int) -> int:
+        """Set plan for every non-banned user. Returns count updated."""
+        try:
+            user_ids = [d['user_id'] for d in
+                        self.users.find({'is_banned': False}, {'user_id': 1, '_id': 0})]
+            now = datetime.now(timezone.utc)
+            for uid in user_ids:
+                self.subscriptions.update_one(
+                    {'user_id': uid},
+                    {'$set': {
+                        'plan_id':    plan_id,
+                        'started_at': now,
+                        'expires_at': expires_at,
+                        'granted_by': granted_by,
+                    }},
+                    upsert=True
+                )
+            return len(user_ids)
+        except Exception as e:
+            logger.error(f"Error in set_plan_all_users: {e}")
+            return 0
+
+    # ------------------------------------------------------------------ #
+    # Activation Keys
+    # ------------------------------------------------------------------ #
+
+    def create_activation_keys(self, keys: list, plan_id: str,
+                               days: int, created_by: int,
+                               max_uses: int = 1) -> int:
+        """Bulk-insert activation keys. Returns count inserted."""
+        from pymongo.errors import BulkWriteError
+        now  = datetime.now(timezone.utc)
+        docs = []
+        for k in keys:
+            docs.append({
+                'key':        k,
+                'plan_id':    plan_id,
+                'days':       days,
+                'max_uses':   max_uses,
+                'uses':       0,
+                'used_by':    [],
+                'created_by': created_by,
+                'created_at': now,
+                'active':     True,
+            })
+        if not docs:
+            return 0
+        try:
+            result = self.activation_keys.insert_many(docs, ordered=False)
+            return len(result.inserted_ids)
+        except BulkWriteError as bwe:
+            # ordered=False: partial inserts succeed; count what actually went in
+            inserted = bwe.details.get('nInserted', 0)
+            logger.warning(f"Partial key insert: {inserted}/{len(docs)} inserted (duplicates skipped)")
+            return inserted
+        except Exception as e:
+            logger.error(f"Error creating keys: {e}")
+            return 0
+
+    def redeem_key(self, key: str, user_id: int):
+        """
+        Redeem an activation key for a user.
+        Returns (success, message, key_doc).
+        """
+        try:
+            doc = self.activation_keys.find_one({'key': key})
+            if not doc:
+                return False, "❌ Key not found.", None
+            if not doc.get('active', True):
+                return False, "❌ This key has been deactivated.", None
+            if user_id in (doc.get('used_by') or []):
+                return False, "❌ You have already used this key.", None
+            if doc['uses'] >= doc['max_uses']:
+                return False, "❌ This key has already been fully used.", None
+
+            expires_at = datetime.now(timezone.utc) + timedelta(days=doc['days'])
+            self.set_user_plan(user_id, doc['plan_id'],
+                               expires_at=expires_at, granted_by=None)
+
+            self.activation_keys.update_one(
+                {'key': key},
+                {
+                    '$inc': {'uses': 1},
+                    '$push': {'used_by': user_id},
+                    '$set': {'active': doc['uses'] + 1 < doc['max_uses']},
+                }
+            )
+            return True, "✅ Key redeemed!", doc
+
+        except Exception as e:
+            logger.error(f"Error redeeming key {key}: {e}")
+            return False, f"❌ Error: {e}", None
+
+    def get_key_info(self, key: str):
+        try:
+            return self.activation_keys.find_one({'key': key}, {'_id': 0})
+        except Exception as e:
+            logger.error(f"Error getting key info: {e}")
+            return None
+
+    # ------------------------------------------------------------------ #
+    # Dynamic Plan Pricing
+    # ------------------------------------------------------------------ #
+
+    def get_plan_price(self, plan_id: str):
+        """Return override price in Stars, or None if no override set."""
+        try:
+            doc = self.plan_prices.find_one({'plan_id': plan_id})
+            return doc['price_stars'] if doc else None
+        except Exception as e:
+            logger.error(f"Error getting plan price: {e}")
+            return None
+
+    def set_plan_price(self, plan_id: str, price_stars: int, set_by: int) -> bool:
+        try:
+            self.plan_prices.update_one(
+                {'plan_id': plan_id},
+                {'$set': {
+                    'price_stars': price_stars,
+                    'set_by':      set_by,
+                    'updated_at':  datetime.now(timezone.utc),
+                }},
+                upsert=True
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Error setting plan price: {e}")
+            return False
+
+    def get_effective_price(self, plan_id: str, default_price: int) -> int:
+        """Return DB override price if set, else the default."""
+        override = self.get_plan_price(plan_id)
+        return override if override is not None else default_price
