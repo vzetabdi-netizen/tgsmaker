@@ -1,116 +1,55 @@
 """
-Database module — user management, statistics, and subscription/plan system.
+Database module — MongoDB version (pymongo).
+Drop-in replacement for the PostgreSQL version.
+All public method signatures are identical so the rest of the codebase is unchanged.
 """
 
 import os
 import logging
-import psycopg2
-from psycopg2.extras import RealDictCursor
-from datetime import datetime
+from datetime import datetime, timedelta
+
+from pymongo import MongoClient, DESCENDING
+from pymongo.errors import DuplicateKeyError
 
 logger = logging.getLogger(__name__)
 
 
 class Database:
     def __init__(self):
-        self.connection_string = os.environ.get('DATABASE_URL')
-        if not self.connection_string:
+        uri = os.environ.get('DATABASE_URL')
+        if not uri:
             raise ValueError("DATABASE_URL environment variable not found")
-        self.init_tables()
 
-    def get_connection(self):
-        return psycopg2.connect(self.connection_string)
+        self.client = MongoClient(uri)
+        # Use database name from env or default
+        db_name = os.environ.get('MONGO_DB_NAME', 'svg_tgs_bot')
+        self.db = self.client[db_name]
 
-    # ------------------------------------------------------------------ #
-    # Schema
-    # ------------------------------------------------------------------ #
+        # Collections
+        self.users         = self.db['users']
+        self.subscriptions = self.db['subscriptions']
+        self.payments      = self.db['payments']
+        self.daily_usage   = self.db['daily_usage']
+        self.conversions   = self.db['conversions']
+        self.broadcasts    = self.db['broadcasts']
 
-    def init_tables(self):
+        self._ensure_indexes()
+        logger.info(f"MongoDB connected — database: {db_name}")
+
+    def _ensure_indexes(self):
+        """Create indexes for fast lookups."""
         try:
-            with self.get_connection() as conn:
-                with conn.cursor() as cur:
-
-                    # ── users ──────────────────────────────────────────
-                    cur.execute("""
-                        CREATE TABLE IF NOT EXISTS users (
-                            user_id     BIGINT PRIMARY KEY,
-                            username    VARCHAR(255),
-                            first_name  VARCHAR(255),
-                            last_name   VARCHAR(255),
-                            is_banned   BOOLEAN   DEFAULT FALSE,
-                            is_admin    BOOLEAN   DEFAULT FALSE,
-                            join_date   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                            last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                        )
-                    """)
-
-                    # ── subscriptions ──────────────────────────────────
-                    # plan_id : 'free' | 'pro'
-                    # expires_at NULL  → plan never expires (admin grant or free)
-                    cur.execute("""
-                        CREATE TABLE IF NOT EXISTS subscriptions (
-                            user_id    BIGINT PRIMARY KEY REFERENCES users(user_id) ON DELETE CASCADE,
-                            plan_id    VARCHAR(50)  NOT NULL DEFAULT 'free',
-                            started_at TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
-                            expires_at TIMESTAMP    DEFAULT NULL,
-                            granted_by BIGINT       DEFAULT NULL
-                        )
-                    """)
-
-                    # ── payments (Telegram Stars) ──────────────────────
-                    cur.execute("""
-                        CREATE TABLE IF NOT EXISTS payments (
-                            id                 SERIAL PRIMARY KEY,
-                            user_id            BIGINT REFERENCES users(user_id),
-                            telegram_charge_id VARCHAR(255) UNIQUE,
-                            stars_amount       INTEGER,
-                            plan_id            VARCHAR(50),
-                            status             VARCHAR(50) DEFAULT 'pending',
-                            created_at         TIMESTAMP   DEFAULT CURRENT_TIMESTAMP
-                        )
-                    """)
-
-                    # ── daily usage ───────────────────────────────────
-                    cur.execute("""
-                        CREATE TABLE IF NOT EXISTS daily_usage (
-                            user_id    BIGINT REFERENCES users(user_id) ON DELETE CASCADE,
-                            usage_date DATE    NOT NULL DEFAULT CURRENT_DATE,
-                            count      INTEGER NOT NULL DEFAULT 0,
-                            PRIMARY KEY (user_id, usage_date)
-                        )
-                    """)
-
-                    # ── conversions ───────────────────────────────────
-                    cur.execute("""
-                        CREATE TABLE IF NOT EXISTS conversions (
-                            id              SERIAL PRIMARY KEY,
-                            user_id         BIGINT REFERENCES users(user_id),
-                            file_name       VARCHAR(255),
-                            file_size       INTEGER,
-                            file_type       VARCHAR(10) DEFAULT 'svg',
-                            conversion_date TIMESTAMP   DEFAULT CURRENT_TIMESTAMP,
-                            success         BOOLEAN     DEFAULT TRUE
-                        )
-                    """)
-
-                    # ── broadcasts ────────────────────────────────────
-                    cur.execute("""
-                        CREATE TABLE IF NOT EXISTS broadcasts (
-                            id            SERIAL PRIMARY KEY,
-                            admin_id      BIGINT,
-                            message_text  TEXT,
-                            media_type    VARCHAR(50),
-                            media_file_id VARCHAR(255),
-                            sent_count    INTEGER   DEFAULT 0,
-                            created_date  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                        )
-                    """)
-
-                conn.commit()
-            logger.info("Database tables initialised successfully")
+            self.users.create_index('user_id', unique=True)
+            self.subscriptions.create_index('user_id', unique=True)
+            self.payments.create_index('telegram_charge_id', unique=True, sparse=True)
+            self.daily_usage.create_index(
+                [('user_id', 1), ('usage_date', 1)], unique=True
+            )
+            self.conversions.create_index('user_id')
+            self.conversions.create_index('conversion_date')
+            logger.info("MongoDB indexes ensured")
         except Exception as e:
-            logger.error(f"Error initialising database: {e}")
-            raise
+            logger.error(f"Index creation error: {e}")
 
     # ------------------------------------------------------------------ #
     # User management
@@ -118,83 +57,80 @@ class Database:
 
     def add_user(self, user_id, username=None, first_name=None, last_name=None):
         try:
-            with self.get_connection() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("""
-                        INSERT INTO users (user_id, username, first_name, last_name, last_active)
-                        VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP)
-                        ON CONFLICT (user_id) DO UPDATE SET
-                            username    = EXCLUDED.username,
-                            first_name  = EXCLUDED.first_name,
-                            last_name   = EXCLUDED.last_name,
-                            last_active = CURRENT_TIMESTAMP
-                    """, (user_id, username, first_name, last_name))
-
-                    # Ensure a subscription row exists (default free)
-                    cur.execute("""
-                        INSERT INTO subscriptions (user_id, plan_id)
-                        VALUES (%s, 'free')
-                        ON CONFLICT (user_id) DO NOTHING
-                    """, (user_id,))
-
-                conn.commit()
+            now = datetime.utcnow()
+            self.users.update_one(
+                {'user_id': user_id},
+                {'$set': {
+                    'username':    username,
+                    'first_name':  first_name,
+                    'last_name':   last_name,
+                    'last_active': now,
+                },
+                 '$setOnInsert': {
+                    'user_id':   user_id,
+                    'is_banned': False,
+                    'is_admin':  False,
+                    'join_date': now,
+                }},
+                upsert=True
+            )
+            # Ensure subscription row exists
+            self.subscriptions.update_one(
+                {'user_id': user_id},
+                {'$setOnInsert': {
+                    'user_id':    user_id,
+                    'plan_id':    'free',
+                    'started_at': now,
+                    'expires_at': None,
+                    'granted_by': None,
+                }},
+                upsert=True
+            )
         except Exception as e:
             logger.error(f"Error adding user {user_id}: {e}")
 
     def ban_user(self, user_id: int) -> bool:
         try:
-            with self.get_connection() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("UPDATE users SET is_banned = TRUE WHERE user_id = %s", (user_id,))
-                    affected = cur.rowcount
-                conn.commit()
-            return affected > 0
+            res = self.users.update_one(
+                {'user_id': user_id}, {'$set': {'is_banned': True}}
+            )
+            return res.matched_count > 0
         except Exception as e:
             logger.error(f"Error banning user {user_id}: {e}")
             return False
 
     def unban_user(self, user_id: int) -> bool:
         try:
-            with self.get_connection() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("UPDATE users SET is_banned = FALSE WHERE user_id = %s", (user_id,))
-                    affected = cur.rowcount
-                conn.commit()
-            return affected > 0
+            res = self.users.update_one(
+                {'user_id': user_id}, {'$set': {'is_banned': False}}
+            )
+            return res.matched_count > 0
         except Exception as e:
             logger.error(f"Error unbanning user {user_id}: {e}")
             return False
 
     def is_user_banned(self, user_id: int) -> bool:
         try:
-            with self.get_connection() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("SELECT is_banned FROM users WHERE user_id = %s", (user_id,))
-                    row = cur.fetchone()
-                    return bool(row[0]) if row else False
+            doc = self.users.find_one({'user_id': user_id}, {'is_banned': 1})
+            return bool(doc.get('is_banned', False)) if doc else False
         except Exception as e:
             logger.error(f"Error checking ban for {user_id}: {e}")
             return False
 
     def is_admin(self, user_id: int) -> bool:
         try:
-            with self.get_connection() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("SELECT is_admin FROM users WHERE user_id = %s", (user_id,))
-                    row = cur.fetchone()
-                    return bool(row[0]) if row else False
+            doc = self.users.find_one({'user_id': user_id}, {'is_admin': 1})
+            return bool(doc.get('is_admin', False)) if doc else False
         except Exception as e:
             logger.error(f"Error checking admin for {user_id}: {e}")
             return False
 
     def set_admin(self, user_id: int, is_admin: bool = True) -> bool:
         try:
-            with self.get_connection() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("UPDATE users SET is_admin = %s WHERE user_id = %s", (is_admin, user_id))
-                    affected = cur.rowcount
-                conn.commit()
-            return affected > 0
+            res = self.users.update_one(
+                {'user_id': user_id}, {'$set': {'is_admin': is_admin}}
+            )
+            return res.matched_count > 0
         except Exception as e:
             logger.error(f"Error setting admin for {user_id}: {e}")
             return False
@@ -206,51 +142,42 @@ class Database:
     def get_user_plan(self, user_id: int) -> str:
         """
         Return the user's active plan_id ('free' or 'pro').
-        Auto-downgrades expired Pro subscriptions to 'free'.
+        Auto-downgrades expired Pro subscriptions.
         """
         try:
-            with self.get_connection() as conn:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "SELECT plan_id, expires_at FROM subscriptions WHERE user_id = %s",
-                        (user_id,)
+            doc = self.subscriptions.find_one({'user_id': user_id})
+            if not doc:
+                return 'free'
+
+            plan_id    = doc.get('plan_id', 'free')
+            expires_at = doc.get('expires_at')
+
+            if plan_id != 'free' and expires_at is not None:
+                if datetime.utcnow() > expires_at:
+                    self.subscriptions.update_one(
+                        {'user_id': user_id},
+                        {'$set': {'plan_id': 'free', 'expires_at': None}}
                     )
-                    row = cur.fetchone()
-                    if not row:
-                        return 'free'
+                    logger.info(f"User {user_id} Pro expired → Free")
+                    return 'free'
 
-                    plan_id, expires_at = row
-
-                    if plan_id != 'free' and expires_at is not None:
-                        if datetime.utcnow() > expires_at:
-                            cur.execute("""
-                                UPDATE subscriptions
-                                SET plan_id = 'free', expires_at = NULL
-                                WHERE user_id = %s
-                            """, (user_id,))
-                            conn.commit()
-                            logger.info(f"User {user_id} Pro expired → downgraded to Free")
-                            return 'free'
-
-                    return plan_id or 'free'
+            return plan_id
         except Exception as e:
             logger.error(f"Error getting plan for {user_id}: {e}")
             return 'free'
 
     def get_subscription_info(self, user_id: int) -> dict:
-        """Full subscription row as a dict."""
         try:
-            with self.get_connection() as conn:
-                with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                    cur.execute("""
-                        SELECT plan_id, started_at, expires_at, granted_by
-                        FROM subscriptions WHERE user_id = %s
-                    """, (user_id,))
-                    row = cur.fetchone()
-                    return dict(row) if row else {
-                        'plan_id': 'free', 'started_at': None,
-                        'expires_at': None, 'granted_by': None
-                    }
+            doc = self.subscriptions.find_one({'user_id': user_id})
+            if not doc:
+                return {'plan_id': 'free', 'started_at': None,
+                        'expires_at': None, 'granted_by': None}
+            return {
+                'plan_id':    doc.get('plan_id', 'free'),
+                'started_at': doc.get('started_at'),
+                'expires_at': doc.get('expires_at'),
+                'granted_by': doc.get('granted_by'),
+            }
         except Exception as e:
             logger.error(f"Error getting subscription info for {user_id}: {e}")
             return {'plan_id': 'free'}
@@ -262,23 +189,17 @@ class Database:
         expires_at: datetime | None = None,
         granted_by: int | None = None,
     ) -> bool:
-        """
-        Activate a plan for a user.
-        expires_at=None → never expires (admin grant).
-        """
         try:
-            with self.get_connection() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("""
-                        INSERT INTO subscriptions (user_id, plan_id, started_at, expires_at, granted_by)
-                        VALUES (%s, %s, CURRENT_TIMESTAMP, %s, %s)
-                        ON CONFLICT (user_id) DO UPDATE SET
-                            plan_id    = EXCLUDED.plan_id,
-                            started_at = CURRENT_TIMESTAMP,
-                            expires_at = EXCLUDED.expires_at,
-                            granted_by = EXCLUDED.granted_by
-                    """, (user_id, plan_id, expires_at, granted_by))
-                conn.commit()
+            self.subscriptions.update_one(
+                {'user_id': user_id},
+                {'$set': {
+                    'plan_id':    plan_id,
+                    'started_at': datetime.utcnow(),
+                    'expires_at': expires_at,
+                    'granted_by': granted_by,
+                }},
+                upsert=True
+            )
             logger.info(f"Plan '{plan_id}' set for user {user_id} (expires: {expires_at})")
             return True
         except Exception as e:
@@ -290,32 +211,24 @@ class Database:
     # ------------------------------------------------------------------ #
 
     def get_today_usage(self, user_id: int) -> int:
-        """Successful conversions today."""
         try:
-            with self.get_connection() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("""
-                        SELECT count FROM daily_usage
-                        WHERE user_id = %s AND usage_date = CURRENT_DATE
-                    """, (user_id,))
-                    row = cur.fetchone()
-                    return row[0] if row else 0
+            today = datetime.utcnow().strftime('%Y-%m-%d')
+            doc   = self.daily_usage.find_one(
+                {'user_id': user_id, 'usage_date': today}
+            )
+            return doc.get('count', 0) if doc else 0
         except Exception as e:
             logger.error(f"Error getting usage for {user_id}: {e}")
             return 0
 
     def increment_today_usage(self, user_id: int, amount: int = 1):
-        """Upsert the daily usage counter."""
         try:
-            with self.get_connection() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("""
-                        INSERT INTO daily_usage (user_id, usage_date, count)
-                        VALUES (%s, CURRENT_DATE, %s)
-                        ON CONFLICT (user_id, usage_date) DO UPDATE
-                        SET count = daily_usage.count + EXCLUDED.count
-                    """, (user_id, amount))
-                conn.commit()
+            today = datetime.utcnow().strftime('%Y-%m-%d')
+            self.daily_usage.update_one(
+                {'user_id': user_id, 'usage_date': today},
+                {'$inc': {'count': amount}},
+                upsert=True
+            )
         except Exception as e:
             logger.error(f"Error incrementing usage for {user_id}: {e}")
 
@@ -327,7 +240,7 @@ class Database:
         if daily_limit == -1:
             used = self.get_today_usage(user_id)
             return True, used, -1
-        used = self.get_today_usage(user_id)
+        used      = self.get_today_usage(user_id)
         remaining = max(0, daily_limit - used)
         return remaining > 0, used, remaining
 
@@ -342,34 +255,32 @@ class Database:
         stars_amount: int,
         plan_id: str,
         status: str = 'completed',
-    ) -> int | None:
+    ) -> str | None:
         try:
-            with self.get_connection() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("""
-                        INSERT INTO payments
-                            (user_id, telegram_charge_id, stars_amount, plan_id, status)
-                        VALUES (%s, %s, %s, %s, %s)
-                        ON CONFLICT (telegram_charge_id) DO NOTHING
-                        RETURNING id
-                    """, (user_id, telegram_charge_id, stars_amount, plan_id, status))
-                    row = cur.fetchone()
-                conn.commit()
-            return row[0] if row else None
+            doc = {
+                'user_id':            user_id,
+                'telegram_charge_id': telegram_charge_id,
+                'stars_amount':       stars_amount,
+                'plan_id':            plan_id,
+                'status':             status,
+                'created_at':         datetime.utcnow(),
+            }
+            result = self.payments.insert_one(doc)
+            return str(result.inserted_id)
+        except DuplicateKeyError:
+            logger.warning(f"Duplicate payment charge_id: {telegram_charge_id}")
+            return None
         except Exception as e:
             logger.error(f"Error logging payment for {user_id}: {e}")
             return None
 
     def get_payment_history(self, user_id: int, limit: int = 10) -> list[dict]:
         try:
-            with self.get_connection() as conn:
-                with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                    cur.execute("""
-                        SELECT telegram_charge_id, stars_amount, plan_id, status, created_at
-                        FROM payments WHERE user_id = %s
-                        ORDER BY created_at DESC LIMIT %s
-                    """, (user_id, limit))
-                    return [dict(r) for r in cur.fetchall()]
+            cursor = self.payments.find(
+                {'user_id': user_id},
+                {'_id': 0}
+            ).sort('created_at', DESCENDING).limit(limit)
+            return list(cursor)
         except Exception as e:
             logger.error(f"Error getting payment history for {user_id}: {e}")
             return []
@@ -387,26 +298,24 @@ class Database:
         file_type: str = 'svg',
     ):
         try:
-            with self.get_connection() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("""
-                        INSERT INTO conversions (user_id, file_name, file_size, success, file_type)
-                        VALUES (%s, %s, %s, %s, %s)
-                    """, (user_id, file_name, file_size, success, file_type))
-                conn.commit()
+            self.conversions.insert_one({
+                'user_id':         user_id,
+                'file_name':       file_name,
+                'file_size':       file_size,
+                'file_type':       file_type,
+                'success':         success,
+                'conversion_date': datetime.utcnow(),
+            })
         except Exception as e:
             logger.error(f"Error logging conversion for {user_id}: {e}")
 
     def get_user_conversion_history(self, user_id: int, limit: int = 10) -> list[dict]:
         try:
-            with self.get_connection() as conn:
-                with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                    cur.execute("""
-                        SELECT file_name, file_size, file_type, success, conversion_date
-                        FROM conversions WHERE user_id = %s
-                        ORDER BY conversion_date DESC LIMIT %s
-                    """, (user_id, limit))
-                    return [dict(r) for r in cur.fetchall()]
+            cursor = self.conversions.find(
+                {'user_id': user_id},
+                {'_id': 0}
+            ).sort('conversion_date', DESCENDING).limit(limit)
+            return list(cursor)
         except Exception as e:
             logger.error(f"Error getting history for {user_id}: {e}")
             return []
@@ -417,43 +326,30 @@ class Database:
 
     def get_stats(self) -> dict:
         try:
-            with self.get_connection() as conn:
-                with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                    cur.execute("SELECT COUNT(*) AS v FROM users")
-                    total_users = cur.fetchone()['v']
+            total_users   = self.users.count_documents({})
+            active_cutoff = datetime.utcnow() - timedelta(days=7)
+            active_users  = self.users.count_documents(
+                {'last_active': {'$gte': active_cutoff}}
+            )
+            banned_users       = self.users.count_documents({'is_banned': True})
+            pro_users          = self.subscriptions.count_documents({'plan_id': 'pro'})
+            total_conversions  = self.conversions.count_documents({})
+            success_conversions = self.conversions.count_documents({'success': True})
 
-                    cur.execute("""
-                        SELECT COUNT(*) AS v FROM users
-                        WHERE last_active >= CURRENT_TIMESTAMP - INTERVAL '7 days'
-                    """)
-                    active_users = cur.fetchone()['v']
-
-                    cur.execute("SELECT COUNT(*) AS v FROM conversions")
-                    total_conversions = cur.fetchone()['v']
-
-                    cur.execute("SELECT COUNT(*) AS v FROM conversions WHERE success = TRUE")
-                    success_conversions = cur.fetchone()['v']
-
-                    cur.execute("SELECT COUNT(*) AS v FROM users WHERE is_banned = TRUE")
-                    banned_users = cur.fetchone()['v']
-
-                    cur.execute("SELECT COUNT(*) AS v FROM subscriptions WHERE plan_id = 'pro'")
-                    pro_users = cur.fetchone()['v']
-
-                    cur.execute("""
-                        SELECT COALESCE(SUM(stars_amount), 0) AS v
-                        FROM payments WHERE status = 'completed'
-                    """)
-                    total_stars = cur.fetchone()['v']
+            stars_agg = list(self.payments.aggregate([
+                {'$match': {'status': 'completed'}},
+                {'$group': {'_id': None, 'total': {'$sum': '$stars_amount'}}}
+            ]))
+            total_stars = stars_agg[0]['total'] if stars_agg else 0
 
             return {
-                'total_users':         total_users,
-                'active_users':        active_users,
-                'total_conversions':   total_conversions,
-                'success_conversions': success_conversions,
-                'banned_users':        banned_users,
-                'pro_users':           pro_users,
-                'total_stars_earned':  total_stars,
+                'total_users':          total_users,
+                'active_users':         active_users,
+                'banned_users':         banned_users,
+                'pro_users':            pro_users,
+                'total_conversions':    total_conversions,
+                'success_conversions':  success_conversions,
+                'total_stars_earned':   total_stars,
                 'success_rate': round(
                     (success_conversions / total_conversions * 100)
                     if total_conversions > 0 else 0, 2
@@ -465,10 +361,8 @@ class Database:
 
     def get_all_users(self) -> list[int]:
         try:
-            with self.get_connection() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("SELECT user_id FROM users WHERE is_banned = FALSE")
-                    return [row[0] for row in cur.fetchall()]
+            cursor = self.users.find({'is_banned': False}, {'user_id': 1, '_id': 0})
+            return [doc['user_id'] for doc in cursor]
         except Exception as e:
             logger.error(f"Error getting all users: {e}")
             return []
@@ -483,29 +377,27 @@ class Database:
         message_text: str,
         media_file_id: str | None = None,
         media_type: str | None = None,
-    ) -> int | None:
+    ) -> str | None:
         try:
-            with self.get_connection() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("""
-                        INSERT INTO broadcasts (admin_id, message_text, media_type, media_file_id)
-                        VALUES (%s, %s, %s, %s) RETURNING id
-                    """, (admin_id, message_text, media_type, media_file_id))
-                    row = cur.fetchone()
-                conn.commit()
-            return row[0] if row else None
+            result = self.broadcasts.insert_one({
+                'admin_id':      admin_id,
+                'message_text':  message_text,
+                'media_type':    media_type,
+                'media_file_id': media_file_id,
+                'sent_count':    0,
+                'created_date':  datetime.utcnow(),
+            })
+            return str(result.inserted_id)
         except Exception as e:
             logger.error(f"Error logging broadcast: {e}")
             return None
 
-    def update_broadcast_count(self, broadcast_id: int, sent_count: int):
+    def update_broadcast_count(self, broadcast_id: str, sent_count: int):
         try:
-            with self.get_connection() as conn:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "UPDATE broadcasts SET sent_count = %s WHERE id = %s",
-                        (sent_count, broadcast_id)
-                    )
-                conn.commit()
+            from bson import ObjectId
+            self.broadcasts.update_one(
+                {'_id': ObjectId(broadcast_id)},
+                {'$set': {'sent_count': sent_count}}
+            )
         except Exception as e:
             logger.error(f"Error updating broadcast count: {e}")
